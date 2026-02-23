@@ -234,24 +234,66 @@ impl SimpleParser {
     fn parse_body(body_str: &str) -> Result<Vec<CStatement>> {
         let mut statements = Vec::new();
         
-        // Parse return statements
-        let return_pattern = regex::Regex::new(r"return\s+([^;]+);").unwrap();
-        for cap in return_pattern.captures_iter(body_str) {
-            let expr = Self::parse_expression(&cap[1])?;
-            statements.push(CStatement::Return(Some(expr)));
-        }
+        // Split body into lines and process each statement
+        let lines: Vec<&str> = body_str
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
         
-        // Parse variable declarations
-        let decl_pattern = regex::Regex::new(r"(int|char|float)\s+(\w+)\s*=\s*([^;]+);").unwrap();
-        for cap in decl_pattern.captures_iter(body_str) {
-            let var_type = Self::parse_type(&cap[1]);
-            let name = cap[2].to_string();
-            let init = Self::parse_expression(&cap[3])?;
-            statements.push(CStatement::VarDecl {
-                name,
-                var_type,
-                init: Some(init),
-            });
+        for line in lines {
+            // Skip if line doesn't end with semicolon (incomplete statement)
+            if !line.ends_with(';') && !line.ends_with('}') {
+                continue;
+            }
+            
+            let line = line.trim_end_matches(';').trim();
+            
+            // Parse return statements
+            if line.starts_with("return") {
+                let return_pattern = regex::Regex::new(r"return\s+(.+)").unwrap();
+                if let Some(cap) = return_pattern.captures(line) {
+                    let expr = Self::parse_expression(&cap[1])?;
+                    statements.push(CStatement::Return(Some(expr)));
+                    continue;
+                }
+            }
+            
+            // Parse variable declarations with initialization
+            let decl_pattern = regex::Regex::new(r"^(int|char|float|double)\s+(\w+)\s*=\s*(.+)$").unwrap();
+            if let Some(cap) = decl_pattern.captures(line) {
+                let var_type = Self::parse_type(&cap[1]);
+                let name = cap[2].to_string();
+                let init = Self::parse_expression(&cap[3])?;
+                statements.push(CStatement::VarDecl {
+                    name,
+                    var_type,
+                    init: Some(init),
+                });
+                continue;
+            }
+            
+            // Parse variable declarations without initialization
+            let decl_simple_pattern = regex::Regex::new(r"^(int|char|float|double)\s+(\w+)$").unwrap();
+            if let Some(cap) = decl_simple_pattern.captures(line) {
+                let var_type = Self::parse_type(&cap[1]);
+                let name = cap[2].to_string();
+                statements.push(CStatement::VarDecl {
+                    name,
+                    var_type,
+                    init: None,
+                });
+                continue;
+            }
+            
+            // Parse assignments (for variables already declared)
+            let assign_pattern = regex::Regex::new(r"^(\w+)\s*=\s*(.+)$").unwrap();
+            if let Some(cap) = assign_pattern.captures(line) {
+                let target = cap[1].to_string();
+                let value = Self::parse_expression(&cap[2])?;
+                statements.push(CStatement::Assignment { target, value });
+                continue;
+            }
         }
         
         Ok(statements)

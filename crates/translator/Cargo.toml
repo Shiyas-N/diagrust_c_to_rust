@@ -1,0 +1,8 @@
+[package]
+name = "translator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ast_input = { path = "../ast_input" }
+anyhow.workspace = true

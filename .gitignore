@@ -1,0 +1,86 @@
+# .gitignore for DIAGRUST project
+
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo lock file (uncomment if you want to commit it for applications)
+# Cargo.lock
+
+# Generated files
+*.rs.bk
+*.pdb
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Generated Rust files from C translation (optional - comment out if you want to track them)
+tests/c_samples/*.rs
+tests/**/*.rs
+examples/**/*.rs
+
+# Temporary files
+*.tmp
+*.temp
+/temp/
+/tmp/
+
+# Log files
+*.log
+test_report.txt
+
+# OS generated files
+Thumbs.db
+.DS_Store
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Rust profiling and debugging
+*.profraw
+*.profdata
+
+# Documentation build
+/target/doc/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Test outputs
+/test_output/
+/output/
+
+# Temporary rustc directories
+diagrust_temp/
+/tmp/
+
+# Environment files
+.env
+.env.local
+
+# Build artifacts from setup scripts
+setup.log
+build.log
+
+# Coverage reports
+*.gcda
+*.gcno
+*.gcov
+lcov.info
+coverage/
+
+# Benchmarking results
+criterion/
+bench_results/
+
+# Project-specific temporary directories
+/diagrust_temp/
+/.cache/

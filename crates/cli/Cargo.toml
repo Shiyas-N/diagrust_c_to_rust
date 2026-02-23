@@ -1,0 +1,15 @@
+[package]
+name = "diagrust-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "diagrust"
+path = "src/main.rs"
+
+[dependencies]
+ast_input = { path = "../ast_input" }
+translator = { path = "../translator" }
+compiler_loop = { path = "../compiler_loop" }
+anyhow.workspace = true
+clap = { version = "4.4", features = ["derive"] }

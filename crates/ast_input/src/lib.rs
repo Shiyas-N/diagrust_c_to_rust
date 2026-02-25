@@ -126,6 +126,13 @@ impl InputValidator {
         // Check for common syntax errors
         self.check_common_errors(source)?;
         
+        // Advanced validations (if strict mode)
+        if self.strict_mode {
+            self.check_type_mismatches(source)?;
+            self.check_uninitialized_usage(source)?;
+            self.check_function_definitions(source)?;
+        }
+        
         Ok(())
     }
     
@@ -137,6 +144,10 @@ impl InputValidator {
             ("__asm", "inline assembly"),
             ("union", "unions"),
             ("#define", "complex macros (simple defines ok)"),
+            ("switch", "switch statements (use if-else)"),
+            ("typedef", "typedef (use direct types)"),
+            ("static", "static variables"),
+            ("extern", "extern declarations"),
         ];
         
         for (keyword, feature) in unsupported {
@@ -171,6 +182,17 @@ impl InputValidator {
             });
         }
         
+        // Check brackets
+        let open_brackets = source.matches('[').count();
+        let close_brackets = source.matches(']').count();
+        
+        if open_brackets != close_brackets {
+            return Err(ValidationError::SyntaxError {
+                line: 0,
+                message: format!("Mismatched brackets: {} open, {} close", open_brackets, close_brackets),
+            });
+        }
+        
         // Check for at least one function
         if !source.contains("(") || !source.contains(")") {
             return Err(ValidationError::SyntaxError {
@@ -189,18 +211,17 @@ impl InputValidator {
             let trimmed = line.trim();
             
             // Skip empty lines and comments
-            if trimmed.is_empty() || trimmed.starts_with("//") {
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*") {
                 continue;
             }
             
             // Check for missing semicolons after statements
-            // Look for lines that should end with ; but don't
-            if self.should_have_semicolon(trimmed) && !trimmed.ends_with(';') && !trimmed.ends_with('{') && !trimmed.ends_with('}') {
+            if self.should_have_semicolon(trimmed) && !trimmed.ends_with(';') 
+                && !trimmed.ends_with('{') && !trimmed.ends_with('}') {
                 // Check if next line might be continuation
                 if line_num + 1 < lines.len() {
                     let next_line = lines[line_num + 1].trim();
-                    // If next line doesn't start with these, likely missing semicolon
-                    if !next_line.starts_with('{') && !next_line.is_empty() {
+                    if !next_line.starts_with('{') && !next_line.is_empty() && !next_line.starts_with(')') {
                         return Err(ValidationError::SyntaxError {
                             line: line_num + 1,
                             message: format!("Possible missing semicolon: '{}'", trimmed),
@@ -209,12 +230,160 @@ impl InputValidator {
                 }
             }
             
-            // Check for missing closing brace in context
-            if trimmed.contains("return") && !trimmed.ends_with(';') && !trimmed.ends_with('}') {
+            // Check for missing semicolon specifically after return
+            if trimmed.contains("return") && !trimmed.ends_with(';') && !trimmed.ends_with('{') && !trimmed.ends_with('}') {
                 return Err(ValidationError::SyntaxError {
                     line: line_num + 1,
                     message: format!("Missing semicolon after return statement: '{}'", trimmed),
                 });
+            }
+            
+            // Check for assignment without declaration
+            if trimmed.contains('=') && !trimmed.contains("==") && !trimmed.ends_with(';') {
+                let has_type = ["int", "float", "char", "double", "void"].iter().any(|t| trimmed.contains(t));
+                if has_type {
+                    return Err(ValidationError::SyntaxError {
+                        line: line_num + 1,
+                        message: format!("Missing semicolon after variable declaration: '{}'", trimmed),
+                    });
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn check_type_mismatches(&self, source: &str) -> Result<(), ValidationError> {
+        let lines: Vec<&str> = source.lines().collect();
+        
+        for (line_num, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            
+            // Check for obvious type mismatches
+            // Example: int x = "string"; or float x = 'c';
+            
+            // Integer assigned string
+            if trimmed.contains("int") && trimmed.contains('=') && trimmed.contains('"') {
+                return Err(ValidationError::SyntaxError {
+                    line: line_num + 1,
+                    message: format!("Type mismatch: integer variable assigned string literal: '{}'", trimmed),
+                });
+            }
+            
+            // Float/double assigned character
+            if (trimmed.contains("float") || trimmed.contains("double")) 
+                && trimmed.contains('=') && trimmed.contains('\'') {
+                return Err(ValidationError::SyntaxError {
+                    line: line_num + 1,
+                    message: format!("Type mismatch: float/double assigned character literal: '{}'", trimmed),
+                });
+            }
+            
+            // Char assigned string
+            if trimmed.contains("char") && !trimmed.contains("char*") 
+                && trimmed.contains('=') && trimmed.contains('"') {
+                return Err(ValidationError::SyntaxError {
+                    line: line_num + 1,
+                    message: format!("Type mismatch: char variable assigned string literal (use char* or single char): '{}'", trimmed),
+                });
+            }
+            
+            // Void variable (can't declare void variable)
+            if trimmed.starts_with("void ") && trimmed.contains('=') {
+                return Err(ValidationError::SyntaxError {
+                    line: line_num + 1,
+                    message: format!("Invalid: cannot declare void variable: '{}'", trimmed),
+                });
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn check_uninitialized_usage(&self, source: &str) -> Result<(), ValidationError> {
+        use std::collections::HashSet;
+        
+        let lines: Vec<&str> = source.lines().collect();
+        let mut declared_vars: HashSet<String> = HashSet::new();
+        let mut initialized_vars: HashSet<String> = HashSet::new();
+        
+        for (line_num, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            
+            // Track variable declarations
+            let types = ["int", "float", "char", "double"];
+            for vtype in &types {
+                if trimmed.starts_with(vtype) && trimmed.contains(' ') {
+                    // Extract variable name
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let var_name = parts[1].trim_end_matches(';').trim_end_matches('=').to_string();
+                        declared_vars.insert(var_name.clone());
+                        
+                        // Check if initialized
+                        if trimmed.contains('=') {
+                            initialized_vars.insert(var_name);
+                        }
+                    }
+                }
+            }
+            
+            // Check usage of uninitialized variables in return
+            if trimmed.contains("return") && !trimmed.contains("return;") {
+                for var in &declared_vars {
+                    if trimmed.contains(var) && !initialized_vars.contains(var) {
+                        return Err(ValidationError::SyntaxError {
+                            line: line_num + 1,
+                            message: format!("Warning: returning potentially uninitialized variable '{}': '{}'", var, trimmed),
+                        });
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn check_function_definitions(&self, source: &str) -> Result<(), ValidationError> {
+        let lines: Vec<&str> = source.lines().collect();
+        
+        for (line_num, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            
+            // Check for function declarations without body
+            if (trimmed.contains("int ") || trimmed.contains("void ") || trimmed.contains("float ") || trimmed.contains("char "))
+                && trimmed.contains('(') && trimmed.contains(')') && trimmed.ends_with(';') {
+                return Err(ValidationError::SyntaxError {
+                    line: line_num + 1,
+                    message: format!("Function declaration without definition (forward declaration not supported): '{}'", trimmed),
+                });
+            }
+            
+            // Check for missing return in non-void functions
+            if trimmed.contains("int ") && trimmed.contains('(') && trimmed.contains(')') 
+                && trimmed.ends_with('{') {
+                // This is start of a function, check if it has return
+                let mut has_return = false;
+                for i in (line_num + 1)..lines.len() {
+                    if lines[i].contains("return") {
+                        has_return = true;
+                        break;
+                    }
+                    if lines[i].trim() == "}" {
+                        break;
+                    }
+                }
+                
+                if !has_return {
+                    return Err(ValidationError::SyntaxError {
+                        line: line_num + 1,
+                        message: format!("Non-void function missing return statement: '{}'", trimmed),
+                    });
+                }
             }
         }
         
@@ -225,7 +394,7 @@ impl InputValidator {
         // Statements that should end with semicolon
         let statement_keywords = ["return", "int", "char", "float", "double", "void"];
         
-        // Check if line starts with a statement keyword or looks like an assignment
+        // Check if line starts with a statement keyword
         for keyword in &statement_keywords {
             if line.starts_with(keyword) {
                 return true;
@@ -233,13 +402,12 @@ impl InputValidator {
         }
         
         // Check for assignment pattern (variable = ...)
-        if line.contains('=') && !line.contains("==") {
+        if line.contains('=') && !line.contains("==") && !line.contains("<=") && !line.contains(">=") {
             return true;
         }
         
         // Check for function calls (word followed by parentheses)
         if line.contains('(') && line.contains(')') && !line.contains("if") && !line.contains("while") && !line.contains("for") {
-            // Could be function declaration or call
             let has_type = statement_keywords.iter().any(|k| line.contains(k));
             if !has_type && !line.ends_with('{') {
                 return true;

@@ -300,61 +300,222 @@ impl SimpleParser {
     }
     
     fn parse_expression(expr_str: &str) -> Result<CExpression> {
-        let expr = expr_str.trim();
-        
-        // Integer literal
-        if let Ok(num) = expr.parse::<i64>() {
-            return Ok(CExpression::Literal(CLiteral::Int(num)));
-        }
-        
-        // Binary operations
-        if expr.contains('+') {
-            let parts: Vec<&str> = expr.splitn(2, '+').collect();
-            if parts.len() == 2 {
-                let left = Self::parse_expression(parts[0])?;
-                let right = Self::parse_expression(parts[1])?;
-                return Ok(CExpression::BinaryOp {
-                    left: Box::new(left),
-                    op: BinOp::Add,
-                    right: Box::new(right),
-                });
-            }
-        }
-        
-        if expr.contains('-') && !expr.starts_with('-') {
-            let parts: Vec<&str> = expr.splitn(2, '-').collect();
-            if parts.len() == 2 {
-                let left = Self::parse_expression(parts[0])?;
-                let right = Self::parse_expression(parts[1])?;
-                return Ok(CExpression::BinaryOp {
-                    left: Box::new(left),
-                    op: BinOp::Sub,
-                    right: Box::new(right),
-                });
-            }
-        }
-        
-        if expr.contains('*') {
-            let parts: Vec<&str> = expr.splitn(2, '*').collect();
-            if parts.len() == 2 {
-                let left = Self::parse_expression(parts[0])?;
-                let right = Self::parse_expression(parts[1])?;
-                return Ok(CExpression::BinaryOp {
-                    left: Box::new(left),
-                    op: BinOp::Mul,
-                    right: Box::new(right),
-                });
-            }
-        }
-        
-        // Variable
-        if expr.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return Ok(CExpression::Variable(expr.to_string()));
-        }
-        
-        // Default: treat as variable
-        Ok(CExpression::Variable(expr.to_string()))
+    let expr = expr_str.trim();
+    
+    // Integer literal
+    if let Ok(num) = expr.parse::<i64>() {
+        return Ok(CExpression::Literal(CLiteral::Int(num)));
     }
+    
+    // Float literal (contains decimal point)
+    if expr.contains('.') {
+        if let Ok(num) = expr.parse::<f64>() {
+            return Ok(CExpression::Literal(CLiteral::Float(num)));
+        }
+    }
+    
+    // String literal
+    if expr.starts_with('"') && expr.ends_with('"') {
+        let content = expr.trim_matches('"').to_string();
+        return Ok(CExpression::Literal(CLiteral::String(content)));
+    }
+    
+    // Character literal
+    if expr.starts_with('\'') && expr.ends_with('\'') && expr.len() == 3 {
+        let ch = expr.chars().nth(1).unwrap();
+        return Ok(CExpression::Literal(CLiteral::Char(ch)));
+    }
+    
+    // Function call: name(args)
+    let call_pattern = regex::Regex::new(r"^(\w+)\s*\(([^)]*)\)$").unwrap();
+    if let Some(cap) = call_pattern.captures(expr) {
+        let func_name = cap[1].to_string();
+        let args_str = cap[2].trim();
+        let args: Vec<CExpression> = if args_str.is_empty() {
+            vec![]
+        } else {
+            args_str.split(',')
+                .map(|a| Self::parse_expression(a.trim()))
+                .collect::<Result<Vec<_>>>()?
+        };
+        return Ok(CExpression::Call {
+            function: func_name,
+            args,
+        });
+    }
+    
+    // Binary operations - parse from lowest to highest precedence
+    // Logical OR (||)
+    if let Some(pos) = expr.rfind("||") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Or,
+            right: Box::new(right),
+        });
+    }
+    
+    // Logical AND (&&)
+    if let Some(pos) = expr.rfind("&&") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::And,
+            right: Box::new(right),
+        });
+    }
+    
+    // Equality operators (==, !=)
+    if let Some(pos) = expr.rfind("==") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Equal,
+            right: Box::new(right),
+        });
+    }
+    
+    if let Some(pos) = expr.rfind("!=") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::NotEqual,
+            right: Box::new(right),
+        });
+    }
+    
+    // Comparison operators (<, <=, >, >=)
+    if let Some(pos) = expr.rfind("<=") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::LessEq,
+            right: Box::new(right),
+        });
+    }
+    
+    if let Some(pos) = expr.rfind(">=") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::GreaterEq,
+            right: Box::new(right),
+        });
+    }
+    
+    if let Some(pos) = expr.rfind('<') {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Less,
+            right: Box::new(right),
+        });
+    }
+    
+    if let Some(pos) = expr.rfind('>') {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Greater,
+            right: Box::new(right),
+        });
+    }
+    
+    // Addition/Subtraction
+    if let Some(pos) = Self::find_last_op_outside_parens(expr, '+') {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Add,
+            right: Box::new(right),
+        });
+    }
+    
+    // Subtraction (but not negative numbers)
+    if let Some(pos) = Self::find_last_op_outside_parens(expr, '-') {
+        if pos > 0 {  // Not at start (negative number)
+            let left = Self::parse_expression(&expr[..pos])?;
+            let right = Self::parse_expression(&expr[pos+1..])?;
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Sub,
+                right: Box::new(right),
+            });
+        }
+    }
+    
+    // Multiplication/Division/Modulo
+    if let Some(pos) = Self::find_last_op_outside_parens(expr, '*') {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Mul,
+            right: Box::new(right),
+        });
+    }
+    
+    if let Some(pos) = Self::find_last_op_outside_parens(expr, '/') {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Div,
+            right: Box::new(right),
+        });
+    }
+    
+    if let Some(pos) = Self::find_last_op_outside_parens(expr, '%') {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Mod,
+            right: Box::new(right),
+        });
+    }
+    
+    // Parenthesized expression
+    if expr.starts_with('(') && expr.ends_with(')') {
+        let inner = &expr[1..expr.len()-1];
+        return Self::parse_expression(inner);
+    }
+    
+    // Variable name
+    if expr.chars().all(|c| c.is_alphanumeric() || c == '_') && !expr.is_empty() {
+        return Ok(CExpression::Variable(expr.to_string()));
+    }
+    
+    // Default: treat as variable
+    Ok(CExpression::Variable(expr.to_string()))
+}
+
+    
+// Helper function to find operator outside parentheses
+fn find_last_op_outside_parens(expr: &str, op: char) -> Option<usize> {
+    let mut paren_depth = 0;
+    let mut last_pos = None;
+    
+    for (i, ch) in expr.chars().enumerate() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth -= 1,
+            c if c == op && paren_depth == 0 => last_pos = Some(i),
+            _ => {}
+        }
+    }
+    
+    last_pos
+}
 }
 
 pub fn read_c_file(path: &Path) -> Result<String> {

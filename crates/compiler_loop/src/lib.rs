@@ -9,10 +9,12 @@ edition.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+regex = "1.10"
 */
 
 // crates/compiler_loop/src/lib.rs
 use anyhow::{Context, Result};
+use regex;
 use serde::Deserialize;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -117,19 +119,75 @@ impl CompilerLoop {
         let mut repairs_applied = false;
         
         for error in errors {
-            if let Some(ref code_info) = error.code {
-                match code_info.code.as_str() {
-                    "E0425" => {
-                        // Cannot find value - might need to declare variable
-                        if error.message.contains("not found in this scope") {
-                            // MVP: Just add a comment, don't auto-fix
-                            // In full version, this would be more sophisticated
-                        }
+            // Get error code if available
+            let error_code = error.code.as_ref().map(|c| c.code.as_str());
+            
+            // Repair Rule 1: Rust keyword collision
+            if error.message.contains("expected identifier, found keyword") {
+                // Extract the keyword from error message
+                if let Some(keyword) = Self::extract_keyword_from_message(&error.message) {
+                    println!("   🔧 Repair: Renaming Rust keyword '{}' to '{}_val'", keyword, keyword);
+                    
+                    // Replace variable declarations with keyword
+                    let pattern = format!(r"let {}: ", keyword);
+                    let replacement = format!("let {}_val: ", keyword);
+                    repaired_code = repaired_code.replace(&pattern, &replacement);
+                    
+                    // Replace variable uses
+                    let pattern = format!(r"return {};", keyword);
+                    let replacement = format!("return {}_val;", keyword);
+                    repaired_code = repaired_code.replace(&pattern, &replacement);
+                    
+                    repairs_applied = true;
+                }
+            }
+            
+            // Repair Rule 2: Type mismatch - bool assigned to i32
+            if let Some("E0308") = error_code {
+                if error.message.contains("expected `i32`, found `bool`") 
+                    || error.message.contains("mismatched types") {
+                    println!("   🔧 Repair: Converting bool comparison to i32");
+                    
+                    // Find pattern: let var: i32 = comparison;
+                    let bool_pattern = regex::Regex::new(
+                        r"let (\w+): i32 = ([^;]+[<>]=?[^;]+);"
+                    ).unwrap();
+                    
+                    if let Some(cap) = bool_pattern.captures(&repaired_code) {
+                        let var_name = &cap[1];
+                        let comparison = &cap[2];
+                        let replacement = format!(
+                            "let {}: i32 = if {} {{ 1 }} else {{ 0 }};",
+                            var_name, comparison
+                        );
+                        repaired_code = bool_pattern.replace(&repaired_code, replacement).to_string();
+                        repairs_applied = true;
                     }
-                    "E0308" => {
-                        // Type mismatch - suggest adding type annotations
+                }
+            }
+            
+            // Repair Rule 3: Unused variable warning
+            if error.message.contains("unused variable") || error.message.contains("never read") {
+                // Extract variable name
+                if let Some(var_name) = Self::extract_variable_from_message(&error.message) {
+                    println!("   🔧 Repair: Prefixing unused variable '{}' with '_'", var_name);
+                    
+                    let pattern = format!("let {}: ", var_name);
+                    let replacement = format!("let _{}: ", var_name);
+                    repaired_code = repaired_code.replace(&pattern, &replacement);
+                    repairs_applied = true;
+                }
+            }
+            
+            // Repair Rule 4: Missing return statement
+            if error.message.contains("mismatched types") && error.message.contains("expected `()`") {
+                if !repaired_code.contains("return;") {
+                    println!("   🔧 Repair: Adding missing return statement");
+                    // Add return; before closing brace
+                    if let Some(pos) = repaired_code.rfind('}') {
+                        repaired_code.insert_str(pos, "    return;\n");
+                        repairs_applied = true;
                     }
-                    _ => {}
                 }
             }
         }
@@ -139,6 +197,22 @@ impl CompilerLoop {
         } else {
             Ok(None)
         }
+    }
+    
+    fn extract_keyword_from_message(message: &str) -> Option<String> {
+        // Pattern: "expected identifier, found keyword `mod`"
+        let pattern = regex::Regex::new(r"found keyword `(\w+)`").unwrap();
+        pattern.captures(message)
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+    
+    fn extract_variable_from_message(message: &str) -> Option<String> {
+        // Pattern: "unused variable: `result`"
+        let pattern = regex::Regex::new(r"variable:?\s+`(\w+)`").unwrap();
+        pattern.captures(message)
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().to_string())
     }
 }
 

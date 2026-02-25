@@ -124,41 +124,79 @@ fn main() -> Result<()> {
     
     // Step 6: Compile and check (optional)
     if !args.no_compile {
-        println!("🔨 Step 6: Compiling Rust code...");
+        println!("🔨 Step 6: Compiling Rust code with repair loop...");
         
         let temp_dir = std::env::temp_dir().join("diagrust_temp");
         std::fs::create_dir_all(&temp_dir)?;
         
         let compiler = CompilerLoop::new(5);
-        let result = compiler.compile_rust_code(&rust_code, &temp_dir)
-            .context("Compilation check failed")?;
+        let mut current_code = rust_code.clone();
+        let mut iteration = 0;
+        let max_iterations = 5;
         
-        let metrics = TranslationMetrics::from_result(&result, 1);
-        
-        if result.success {
-            println!("   ✅ Compilation successful!");
-        } else {
-            println!("   ⚠️  Compilation failed with {} error(s)", result.errors.len());
+        loop {
+            iteration += 1;
+            println!("   Iteration {}/{}...", iteration, max_iterations);
             
-            if args.verbose {
-                println!("\n   Errors:");
-                for (i, error) in result.errors.iter().take(5).enumerate() {
-                    println!("     {}. {}", i + 1, error.message);
-                    if let Some(ref code) = error.code {
-                        println!("        Error code: {}", code.code);
+            let result = compiler.compile_rust_code(&current_code, &temp_dir)
+                .context("Compilation check failed")?;
+            
+            if result.success {
+                println!("   ✅ Compilation successful!");
+                
+                // Write the repaired code back if it was fixed
+                if iteration > 1 {
+                    std::fs::write(&output_path, &current_code)
+                        .context("Failed to write repaired output file")?;
+                    println!("   💾 Updated output with repairs");
+                }
+                
+                let metrics = TranslationMetrics::from_result(&result, iteration);
+                println!("\n{}", metrics.to_report());
+                break;
+            } else {
+                println!("   ⚠️  Compilation failed with {} error(s)", result.errors.len());
+                
+                if args.verbose {
+                    println!("\n   Errors:");
+                    for (i, error) in result.errors.iter().take(3).enumerate() {
+                        println!("     {}. {}", i + 1, error.message);
+                        if let Some(ref code) = error.code {
+                            println!("        Error code: {}", code.code);
+                        }
+                    }
+                    if result.errors.len() > 3 {
+                        println!("     ... and {} more", result.errors.len() - 3);
                     }
                 }
-                if result.errors.len() > 5 {
-                    println!("     ... and {} more", result.errors.len() - 5);
+                
+                // Try to repair
+                if iteration < max_iterations {
+                    println!("   🔧 Attempting automatic repairs...");
+                    
+                    if let Some(repaired) = compiler.suggest_repairs(&current_code, &result.errors)? {
+                        current_code = repaired;
+                        println!("   ✓ Repairs applied, retrying compilation...\n");
+                    } else {
+                        println!("   ✗ No automatic repairs available");
+                        let metrics = TranslationMetrics::from_result(&result, iteration);
+                        println!("\n{}", metrics.to_report());
+                        break;
+                    }
+                } else {
+                    println!("   ✗ Max iterations reached");
+                    let metrics = TranslationMetrics::from_result(&result, iteration);
+                    println!("\n{}", metrics.to_report());
+                    break;
                 }
             }
         }
         
-        if args.verbose && !result.warnings.is_empty() {
-            println!("\n   Warnings: {}", result.warnings.len());
+        if args.verbose && iteration > 1 {
+            println!("\n📊 Repair Summary:");
+            println!("   - Iterations needed: {}", iteration);
+            println!("   - Repairs successful: {}", iteration > 1 && current_code != rust_code);
         }
-        
-        println!("\n{}", metrics.to_report());
         
         // Cleanup temp directory
         let _ = std::fs::remove_dir_all(&temp_dir);

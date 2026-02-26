@@ -84,3 +84,6 @@ bench_results/
 # Project-specific temporary directories
 /diagrust_temp/
 /.cache/
+
+**/*.rlib
+*.rlib

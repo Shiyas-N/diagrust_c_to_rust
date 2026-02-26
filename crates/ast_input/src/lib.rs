@@ -560,61 +560,157 @@ impl SimpleParser {
     }
     
     fn parse_expression(expr_str: &str) -> Result<CExpression> {
-        let expr = expr_str.trim();
-        
-        // Integer literal
-        if let Ok(num) = expr.parse::<i64>() {
-            return Ok(CExpression::Literal(CLiteral::Int(num)));
+    let expr = expr_str.trim();
+
+    // ===============================
+    // 1️⃣ Assignment (standalone '=' only)
+    // ===============================
+    if let Some(eq_pos) = expr.find('=') {
+        let prev = expr.chars().nth(eq_pos.wrapping_sub(1));
+        let next = expr.chars().nth(eq_pos + 1);
+
+        let is_comparison =
+            prev == Some('<') ||
+            prev == Some('>') ||
+            prev == Some('!') ||
+            next == Some('=');
+
+        if !is_comparison {
+            let left = Self::parse_expression(expr[..eq_pos].trim())?;
+            let right = Self::parse_expression(expr[eq_pos + 1..].trim())?;
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Assign,
+                right: Box::new(right),
+            });
         }
-        
-        // Binary operations
-        if expr.contains('+') {
-            let parts: Vec<&str> = expr.splitn(2, '+').collect();
-            if parts.len() == 2 {
-                let left = Self::parse_expression(parts[0])?;
-                let right = Self::parse_expression(parts[1])?;
-                return Ok(CExpression::BinaryOp {
-                    left: Box::new(left),
-                    op: BinOp::Add,
-                    right: Box::new(right),
-                });
-            }
-        }
-        
-        if expr.contains('-') && !expr.starts_with('-') {
-            let parts: Vec<&str> = expr.splitn(2, '-').collect();
-            if parts.len() == 2 {
-                let left = Self::parse_expression(parts[0])?;
-                let right = Self::parse_expression(parts[1])?;
-                return Ok(CExpression::BinaryOp {
-                    left: Box::new(left),
-                    op: BinOp::Sub,
-                    right: Box::new(right),
-                });
-            }
-        }
-        
-        if expr.contains('*') {
-            let parts: Vec<&str> = expr.splitn(2, '*').collect();
-            if parts.len() == 2 {
-                let left = Self::parse_expression(parts[0])?;
-                let right = Self::parse_expression(parts[1])?;
-                return Ok(CExpression::BinaryOp {
-                    left: Box::new(left),
-                    op: BinOp::Mul,
-                    right: Box::new(right),
-                });
-            }
-        }
-        
-        // Variable
-        if expr.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return Ok(CExpression::Variable(expr.to_string()));
-        }
-        
-        // Default: treat as variable
-        Ok(CExpression::Variable(expr.to_string()))
     }
+
+    // ===============================
+    // 2️⃣ Equality operators
+    // ===============================
+
+    if expr.contains("==") {
+        let parts: Vec<&str> = expr.splitn(2, "==").collect();
+        if parts.len() == 2 {
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(Self::parse_expression(parts[0].trim())?),
+                op: BinOp::Equal,
+                right: Box::new(Self::parse_expression(parts[1].trim())?),
+            });
+        }
+    }
+
+    if expr.contains("!=") {
+        let parts: Vec<&str> = expr.splitn(2, "!=").collect();
+        if parts.len() == 2 {
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(Self::parse_expression(parts[0].trim())?),
+                op: BinOp::NotEqual,
+                right: Box::new(Self::parse_expression(parts[1].trim())?),
+            });
+        }
+    }
+
+    // ===============================
+    // 3️⃣ Relational operators (longest first)
+    // ===============================
+
+    if expr.contains("<=") {
+        let parts: Vec<&str> = expr.splitn(2, "<=").collect();
+        if parts.len() == 2 {
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(Self::parse_expression(parts[0].trim())?),
+                op: BinOp::LessEq,
+                right: Box::new(Self::parse_expression(parts[1].trim())?),
+            });
+        }
+    }
+
+    if expr.contains(">=") {
+        let parts: Vec<&str> = expr.splitn(2, ">=").collect();
+        if parts.len() == 2 {
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(Self::parse_expression(parts[0].trim())?),
+                op: BinOp::GreaterEq,
+                right: Box::new(Self::parse_expression(parts[1].trim())?),
+            });
+        }
+    }
+
+    if expr.contains('<') {
+        let parts: Vec<&str> = expr.splitn(2, '<').collect();
+        if parts.len() == 2 {
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(Self::parse_expression(parts[0].trim())?),
+                op: BinOp::Less,
+                right: Box::new(Self::parse_expression(parts[1].trim())?),
+            });
+        }
+    }
+
+    if expr.contains('>') {
+        let parts: Vec<&str> = expr.splitn(2, '>').collect();
+        if parts.len() == 2 {
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(Self::parse_expression(parts[0].trim())?),
+                op: BinOp::Greater,
+                right: Box::new(Self::parse_expression(parts[1].trim())?),
+            });
+        }
+    }
+
+    // ===============================
+    // 4️⃣ Arithmetic
+    // ===============================
+
+    if expr.contains('+') {
+        let parts: Vec<&str> = expr.splitn(2, '+').collect();
+        if parts.len() == 2 {
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(Self::parse_expression(parts[0].trim())?),
+                op: BinOp::Add,
+                right: Box::new(Self::parse_expression(parts[1].trim())?),
+            });
+        }
+    }
+
+    if expr.contains('-') && !expr.starts_with('-') {
+        let parts: Vec<&str> = expr.splitn(2, '-').collect();
+        if parts.len() == 2 {
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(Self::parse_expression(parts[0].trim())?),
+                op: BinOp::Sub,
+                right: Box::new(Self::parse_expression(parts[1].trim())?),
+            });
+        }
+    }
+
+    if expr.contains('*') {
+        let parts: Vec<&str> = expr.splitn(2, '*').collect();
+        if parts.len() == 2 {
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(Self::parse_expression(parts[0].trim())?),
+                op: BinOp::Mul,
+                right: Box::new(Self::parse_expression(parts[1].trim())?),
+            });
+        }
+    }
+
+    // ===============================
+    // 5️⃣ Literal
+    // ===============================
+
+    if let Ok(num) = expr.parse::<i64>() {
+        return Ok(CExpression::Literal(CLiteral::Int(num)));
+    }
+
+    // ===============================
+    // 6️⃣ Variable fallback
+    // ===============================
+
+    Ok(CExpression::Variable(expr.to_string()))
+}
 
      /// Parse a single simple statement (used by control flow parser)
     pub fn parse_single_statement(stmt: &str) -> Result<CStatement> {

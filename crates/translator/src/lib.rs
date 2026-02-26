@@ -41,44 +41,53 @@ impl RustTranslator {
     }
 
     fn translate_function(&self, function: &CFunction) -> Result<String> {
-        let mut output = String::new();
+    let mut output = String::new();
 
-        // 🔥 Collect mutable variables first
-        let mutable_vars = Self::collect_mutable_variables(&function.body);
+    // 🔥 Collect mutable variables (locals + parameters)
+    let mutable_vars = Self::collect_mutable_variables(&function.body);
 
-        // Function signature
-        output.push_str("pub fn ");
-        output.push_str(&function.name);
-        output.push('(');
+    // Function signature
+    output.push_str("pub fn ");
+    output.push_str(&function.name);
+    output.push('(');
 
-        for (i, param) in function.parameters.iter().enumerate() {
-            if i > 0 {
-                output.push_str(", ");
-            }
-            output.push_str(&param.name);
-            output.push_str(": ");
-            output.push_str(&self.translate_type(&param.param_type));
+    for (i, param) in function.parameters.iter().enumerate() {
+        if i > 0 {
+            output.push_str(", ");
         }
 
-        output.push(')');
+        // 🔥 Make parameter mutable if reassigned
+        let mut_prefix = if mutable_vars.contains(&param.name) {
+            "mut "
+        } else {
+            ""
+        };
 
-        let return_type = self.translate_type(&function.return_type);
-        if return_type != "()" {
-            output.push_str(" -> ");
-            output.push_str(&return_type);
-        }
-
-        output.push_str(" {\n");
-
-        for stmt in &function.body {
-            let rust_stmt =
-                self.translate_statement(stmt, 1, &mutable_vars)?;
-            output.push_str(&rust_stmt);
-        }
-
-        output.push('}');
-        Ok(output)
+        output.push_str(mut_prefix);
+        output.push_str(&param.name);
+        output.push_str(": ");
+        output.push_str(&self.translate_type(&param.param_type));
     }
+
+    output.push(')');
+
+    let return_type = self.translate_type(&function.return_type);
+    if return_type != "()" {
+        output.push_str(" -> ");
+        output.push_str(&return_type);
+    }
+
+    output.push_str(" {\n");
+
+    for stmt in &function.body {
+        let rust_stmt =
+            self.translate_statement(stmt, 1, &mutable_vars)?;
+        output.push_str(&rust_stmt);
+    }
+
+    output.push('}');
+    Ok(output)
+}
 
     fn translate_type(&self, ctype: &CType) -> String {
         match ctype {
@@ -352,41 +361,54 @@ impl RustTranslator {
     }
 
     fn collect_from_statement(
-        stmt: &CStatement,
-        set: &mut HashSet<String>,
-    ) {
-        match stmt {
-            CStatement::Assignment { target, .. } => {
-                set.insert(target.clone());
-            }
+    stmt: &CStatement,
+    set: &mut HashSet<String>,
+) {
+    match stmt {
 
-            CStatement::If { then_body, else_body, .. } => {
-                for s in then_body {
-                    Self::collect_from_statement(s, set);
-                }
-
-                if let Some(else_stmts) = else_body {
-                    for s in else_stmts {
-                        Self::collect_from_statement(s, set);
-                    }
-                }
-            }
-
-            CStatement::While { body, .. } => {
-                for s in body {
-                    Self::collect_from_statement(s, set);
-                }
-            }
-
-            CStatement::For { body, .. } => {
-                for s in body {
-                    Self::collect_from_statement(s, set);
-                }
-            }
-
-            _ => {}
+        CStatement::Assignment { target, .. } => {
+            set.insert(target.clone());
         }
+
+        CStatement::If { then_body, else_body, .. } => {
+            for s in then_body {
+                Self::collect_from_statement(s, set);
+            }
+
+            if let Some(else_stmts) = else_body {
+                for s in else_stmts {
+                    Self::collect_from_statement(s, set);
+                }
+            }
+        }
+
+        CStatement::While { body, .. } => {
+            for s in body {
+                Self::collect_from_statement(s, set);
+            }
+        }
+
+        CStatement::For { init, increment, body, .. } => {
+
+            // 🔥 Scan init
+            Self::collect_from_statement(init, set);
+
+            // 🔥 Scan increment
+            if let CExpression::BinaryOp { left, op: BinOp::Assign, .. } = increment {
+                if let CExpression::Variable(name) = left.as_ref() {
+                    set.insert(name.clone());
+                }
+            }
+
+            // 🔥 Scan body
+            for s in body {
+                Self::collect_from_statement(s, set);
+            }
+        }
+
+        _ => {}
     }
+}
 }
 
 /// Helper to format Rust code

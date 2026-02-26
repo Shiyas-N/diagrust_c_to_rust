@@ -163,19 +163,44 @@ impl RustTranslator {
                 Ok(output)
             }
             CStatement::For { init, condition, increment, body } => {
-                // Convert for loop to while loop in MVP
                 let mut output = String::new();
+                
+                // Check if this is a simple range-based for loop (i = 0; i < n; i++)
+                if Self::is_simple_range_loop(init, condition, increment) {
+                    // Extract variable name and range
+                    if let CStatement::VarDecl { name, .. } = init.as_ref() {
+                        if let CExpression::BinaryOp { left: _, op: BinOp::Less, right } = condition {
+                            // Generate idiomatic Rust: for i in 0..n
+                            let range_end = self.translate_expression(right)?;
+                            output.push_str(&format!("{}for {} in 0..{} {{\n", indent_str, name, range_end));
+                            
+                            for stmt in body {
+                                output.push_str(&self.translate_statement(stmt, indent + 1)?);
+                            }
+                            
+                            output.push_str(&format!("{}}}\n", indent_str));
+                            return Ok(output);
+                        }
+                    }
+                }
+                
+                // Fallback: convert to while loop
+                // Translate init
                 output.push_str(&self.translate_statement(init, indent)?);
                 
+                // While condition
                 let cond = self.translate_expression(condition)?;
                 output.push_str(&format!("{}while {} {{\n", indent_str, cond));
                 
+                // Body
                 for stmt in body {
                     output.push_str(&self.translate_statement(stmt, indent + 1)?);
                 }
                 
+                // Increment at end
                 let incr = self.translate_expression(increment)?;
                 output.push_str(&format!("{}    {};\n", indent_str, incr));
+                
                 output.push_str(&format!("{}}}\n", indent_str));
                 Ok(output)
             }
@@ -244,6 +269,25 @@ impl RustTranslator {
             UnaryOp::Deref => "*",
             UnaryOp::AddrOf => "&",
         }
+    }
+    
+    // Helper to detect simple range-based for loops
+    fn is_simple_range_loop(init: &CStatement, condition: &CExpression, increment: &CExpression) -> bool {
+        // Check init: int i = 0
+        if let CStatement::VarDecl { init: Some(init_expr), .. } = init {
+            if let CExpression::Literal(CLiteral::Int(0)) = init_expr {
+                // Check condition: i < n
+                if let CExpression::BinaryOp { op: BinOp::Less, .. } = condition {
+                    // Check increment: i++ or i = i + 1
+                    if let CExpression::BinaryOp { op: BinOp::Add, right, .. } = increment {
+                        if let CExpression::Literal(CLiteral::Int(1)) = right.as_ref() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 }
 

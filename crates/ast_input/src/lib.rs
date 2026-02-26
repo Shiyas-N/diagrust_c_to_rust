@@ -16,6 +16,9 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use thiserror::Error;
 
+mod control_flow;
+use control_flow::ControlFlowParser;
+
 #[derive(Error, Debug)]
 pub enum ValidationError {
     #[error("Unsupported feature: {0}")]
@@ -239,7 +242,9 @@ impl InputValidator {
             }
             
             // Check for assignment without declaration
-            if trimmed.contains('=') && !trimmed.contains("==") && !trimmed.ends_with(';') {
+            if trimmed.contains('=') && !trimmed.contains("==") && !trimmed.ends_with(';') && !trimmed.starts_with("for")
+    && !trimmed.starts_with("if")
+    && !trimmed.starts_with("while") {
                 let has_type = ["int", "float", "char", "double", "void"].iter().any(|t| trimmed.contains(t));
                 if has_type {
                     return Err(ValidationError::SyntaxError {
@@ -363,10 +368,11 @@ impl InputValidator {
                 });
             }
             
-            // Check for missing return in non-void functions
+            // FIXED: Check for missing return in non-void functions
+            // Only check if it's a simple function without control flow
             if trimmed.contains("int ") && trimmed.contains('(') && trimmed.contains(')') 
-                && trimmed.ends_with('{') {
-                // This is start of a function, check if it has return
+                && trimmed.ends_with('{') && !source.contains("if") && !source.contains("while") && !source.contains("for") {
+                // This is start of a function without control flow, check if it has return
                 let mut has_return = false;
                 for i in (line_num + 1)..lines.len() {
                     if lines[i].contains("return") {
@@ -423,32 +429,37 @@ pub struct SimpleParser;
 
 impl SimpleParser {
     pub fn parse(source: &str) -> Result<CProgram> {
-        let mut functions = Vec::new();
-        
-        // Very simple parser for MVP - handles basic function patterns
-        let function_pattern = regex::Regex::new(
-            r"(?m)^\s*(int|void|char|float|double)\s+(\w+)\s*\(([^)]*)\)\s*\{([^}]*)\}"
-        ).unwrap();
-        
-        for cap in function_pattern.captures_iter(source) {
-            let return_type = Self::parse_type(&cap[1]);
-            let name = cap[2].to_string();
-            let params_str = &cap[3];
-            let body_str = &cap[4];
-            
-            let parameters = Self::parse_parameters(params_str)?;
-            let body = Self::parse_body(body_str)?;
-            
-            functions.push(CFunction {
-                name,
-                return_type,
-                parameters,
-                body,
-            });
-        }
-        
-        Ok(CProgram { functions })
+    let mut functions = Vec::new();
+
+    let header_pattern = regex::Regex::new(
+        r"(?m)^\s*(int|void|char|float|double)\s+(\w+)\s*\(([^)]*)\)\s*\{"
+    ).unwrap();
+
+    for cap in header_pattern.captures_iter(source) {
+        let return_type = Self::parse_type(&cap[1]);
+        let name = cap[2].to_string();
+        let params_str = &cap[3];
+
+        // Find where this match starts
+        let header_match = cap.get(0).unwrap();
+        let start_index = header_match.end() - 1; // points to '{'
+
+        // Extract full body using brace matching
+        let (body_str, _) = extract_balanced_braces(source, start_index)?;
+
+        let parameters = Self::parse_parameters(params_str)?;
+        let body = ControlFlowParser::parse_body(&body_str)?;
+
+        functions.push(CFunction {
+            name,
+            return_type,
+            parameters,
+            body,
+        });
     }
+
+    Ok(CProgram { functions })
+}
     
     fn parse_type(type_str: &str) -> CType {
         match type_str.trim() {
@@ -604,6 +615,86 @@ impl SimpleParser {
         // Default: treat as variable
         Ok(CExpression::Variable(expr.to_string()))
     }
+
+     /// Parse a single simple statement (used by control flow parser)
+    pub fn parse_single_statement(stmt: &str) -> Result<CStatement> {
+        let stmt = stmt.trim();
+
+        // Return
+        if stmt.starts_with("return") {
+            let expr = stmt.trim_start_matches("return").trim();
+            if expr.is_empty() {
+                return Ok(CStatement::Return(None));
+            } else {
+                let parsed = Self::parse_expression(expr)?;
+                return Ok(CStatement::Return(Some(parsed)));
+            }
+        }
+
+        // Variable declaration with initialization
+        let decl_pattern = regex::Regex::new(r"^(int|char|float|double)\s+(\w+)\s*=\s*(.+)$").unwrap();
+        if let Some(cap) = decl_pattern.captures(stmt) {
+            return Ok(CStatement::VarDecl {
+                name: cap[2].to_string(),
+                var_type: Self::parse_type(&cap[1]),
+                init: Some(Self::parse_expression(&cap[3])?),
+            });
+        }
+
+        // Variable declaration without initialization
+        let decl_simple = regex::Regex::new(r"^(int|char|float|double)\s+(\w+)$").unwrap();
+        if let Some(cap) = decl_simple.captures(stmt) {
+            return Ok(CStatement::VarDecl {
+                name: cap[2].to_string(),
+                var_type: Self::parse_type(&cap[1]),
+                init: None,
+            });
+        }
+
+        // Assignment
+        let assign_pattern = regex::Regex::new(r"^(\w+)\s*=\s*(.+)$").unwrap();
+        if let Some(cap) = assign_pattern.captures(stmt) {
+            return Ok(CStatement::Assignment {
+                target: cap[1].to_string(),
+                value: Self::parse_expression(&cap[2])?,
+            });
+        }
+
+        // Fallback → treat as expression
+        Ok(CStatement::Expression(Self::parse_expression(stmt)?))
+    }
+
+    /// Parse the initialization part of a for loop
+    pub fn parse_for_init(init: &str) -> Result<CStatement> {
+        Self::parse_single_statement(init)
+    }
+
+    /// Parse the increment part of a for loop
+    pub fn parse_for_increment(inc: &str) -> Result<CExpression> {
+        Self::parse_expression(inc)
+    }
+}
+
+fn extract_balanced_braces(code: &str, start_pos: usize) -> Result<(String, usize)> {
+    let mut pos = start_pos + 1;
+    let mut depth = 1;
+    let content_start = pos;
+
+    while pos < code.len() && depth > 0 {
+        match code.chars().nth(pos) {
+            Some('{') => depth += 1,
+            Some('}') => depth -= 1,
+            _ => {}
+        }
+        pos += 1;
+    }
+
+    if depth != 0 {
+        return Err(anyhow::anyhow!("Mismatched braces in function body"));
+    }
+
+    let content = code[content_start..pos - 1].to_string();
+    Ok((content, pos))
 }
 
 pub fn read_c_file(path: &Path) -> Result<String> {

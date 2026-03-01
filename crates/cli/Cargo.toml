@@ -8,8 +8,15 @@ name = "diagrust"
 path = "src/main.rs"
 
 [dependencies]
-ast_input = { path = "../ast_input" }
-translator = { path = "../translator" }
-compiler_loop = { path = "../compiler_loop" }
+ast_input         = { path = "../ast_input" }
+input_validation  = { path = "../input_validation" }
+semantic          = { path = "../semantic" }
+ir                = { path = "../ir" }
+codegen           = { path = "../codegen" }
+repair            = { path = "../repair" }
+compiler_loop     = { path = "../compiler_loop" }
+reporting         = { path = "../reporting" }
 anyhow.workspace = true
-clap = { version = "4.4", features = ["derive"] }
+clap.workspace   = true
+log.workspace    = true
+env_logger.workspace = true

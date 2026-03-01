@@ -1,0 +1,11 @@
+[package]
+name = "codegen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ast_input  = { path = "../ast_input" }
+semantic   = { path = "../semantic" }
+ir         = { path = "../ir" }
+anyhow.workspace = true
+thiserror.workspace = true

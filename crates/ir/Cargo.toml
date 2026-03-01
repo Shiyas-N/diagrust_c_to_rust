@@ -1,0 +1,11 @@
+[package]
+name = "ir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ast_input  = { path = "../ast_input" }
+semantic   = { path = "../semantic" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true

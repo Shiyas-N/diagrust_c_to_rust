@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+repair     = { path = "../repair" }
+reporting  = { path = "../reporting" }
 anyhow.workspace = true
+thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-regex = "1.10"
+regex.workspace = true

@@ -1,8 +1,13 @@
 [workspace]
 members = [
     "crates/ast_input",
-    "crates/translator",
+    "crates/input_validation",
+    "crates/semantic",
+    "crates/ir",
+    "crates/codegen",
+    "crates/repair",
     "crates/compiler_loop",
+    "crates/reporting",
     "crates/cli",
 ]
 resolver = "2"
@@ -10,9 +15,16 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+authors = ["Muhammed Shiyas N"]
+description = "DIAGRUST: Compiler-in-the-Loop Diagnostic-Driven Rust Transpilation"
+
 
 [workspace.dependencies]
 anyhow = "1.0"
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+regex     = "1.10"
+log       = "0.4"
+env_logger = "0.10"
+clap      = { version = "4.4", features = ["derive"] }

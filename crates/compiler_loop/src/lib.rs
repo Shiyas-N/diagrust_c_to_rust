@@ -1,280 +1,289 @@
-// crates/compiler_loop/Cargo.toml
-/*
-[package]
-name = "compiler_loop"
-version.workspace = true
-edition.workspace = true
+//! # Compiler Loop & Repair (Process 0.5)
+//!
+//! Implements the iterative compile → diagnose → repair cycle described in
+//! SRS §4.6.6–4.6.8 and DFD Figure 5.6.
+//!
+//! Sub-processes:
+//!   0.5.1 Compile Code (rustc invocation)
+//!   0.5.2 Repair Strategy Application → delegates to `repair` crate
+//!   0.5.3 Iteration Control & Reporting → returns result to caller
 
-[dependencies]
-anyhow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-regex = "1.10"
-*/
-
-// crates/compiler_loop/src/lib.rs
 use anyhow::{Context, Result};
-use regex;
-use serde::Deserialize;
-use std::path::Path;
+use repair::{DiagnosticParser, RepairAction, RepairEngine, RustcDiagnostic};
+use reporting::{RepairLogEntry, SemanticSummary, TranslationReport, ReportBuilder};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compilation result
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct CompilationResult {
     pub success: bool,
     pub errors: Vec<RustcDiagnostic>,
     pub warnings: Vec<RustcDiagnostic>,
+    pub raw_stderr: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct RustcDiagnostic {
-    pub message: String,
-    #[serde(default)]
-    pub code: Option<DiagnosticCode>,
-    pub level: String,
-    #[serde(default)]
-    pub spans: Vec<DiagnosticSpan>,
+// ─────────────────────────────────────────────────────────────────────────────
+// Loop outcome
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum LoopOutcome {
+    Success {
+        final_code: String,
+        iterations: usize,
+        repair_log: Vec<RepairLogEntry>,
+    },
+    MaxIterationsReached {
+        best_code: String,
+        last_error_count: usize,
+        iterations: usize,
+        repair_log: Vec<RepairLogEntry>,
+    },
+    ConvergenceFailure {
+        code: String,
+        message: String,
+        repair_log: Vec<RepairLogEntry>,
+    },
+    NoCompiler {
+        code: String,
+    },
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct DiagnosticCode {
-    pub code: String,
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Compiler loop
+// ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct DiagnosticSpan {
-    pub file_name: String,
-    pub line_start: usize,
-    pub line_end: usize,
-    pub column_start: usize,
-    pub column_end: usize,
-}
-
-/// Compiler loop - compiles Rust code and analyzes diagnostics
 pub struct CompilerLoop {
-    max_iterations: usize,
+    pub max_iterations: usize,
+    pub temp_dir: PathBuf,
 }
 
 impl CompilerLoop {
     pub fn new(max_iterations: usize) -> Self {
-        Self { max_iterations }
+        let temp_dir = std::env::temp_dir().join(format!("diagrust_{}", std::process::id()));
+        Self { max_iterations, temp_dir }
     }
-    
-    /// Compile Rust code and return diagnostics
-    pub fn compile_rust_code(&self, code: &str, temp_dir: &Path) -> Result<CompilationResult> {
-        // Write code to temporary file
-        let rust_file = temp_dir.join("temp_code.rs");
+
+    pub fn with_temp_dir(max_iterations: usize, temp_dir: PathBuf) -> Self {
+        Self { max_iterations, temp_dir }
+    }
+
+    /// Run the full compile-repair loop (Process 0.5).
+    ///
+    /// Returns the loop outcome along with the full translation report.
+    pub fn run(
+        &self,
+        initial_code: &str,
+        input_file: &str,
+        output_file: &str,
+        original_c: &str,
+        semantic_summary: SemanticSummary,
+        validation_warnings: Vec<String>,
+    ) -> Result<(LoopOutcome, TranslationReport)> {
+        std::fs::create_dir_all(&self.temp_dir)
+            .context("Failed to create temp directory")?;
+
+        // Check if rustc is available
+        if !self.rustc_available() {
+            println!("  ⚠  rustc not found – skipping compilation check.");
+            let outcome = LoopOutcome::NoCompiler { code: initial_code.to_string() };
+            let report = ReportBuilder::build(
+                input_file, output_file, original_c, initial_code,
+                0, self.max_iterations, false, 0, 0,
+                vec![], semantic_summary, validation_warnings,
+            );
+            return Ok((outcome, report));
+        }
+
+        let mut current_code = initial_code.to_string();
+        let mut repair_log: Vec<RepairLogEntry> = Vec::new();
+        let mut last_error_count = usize::MAX;
+        let mut no_progress_count = 0usize;
+
+        for iteration in 1..=self.max_iterations {
+            println!("  🔄 Iteration {}/{}", iteration, self.max_iterations);
+
+            // 0.5.1: Compile
+            let result = self.compile(&current_code)?;
+
+            if result.success {
+                println!("  ✅ Compilation succeeded on iteration {}!", iteration);
+                let outcome = LoopOutcome::Success {
+                    final_code: current_code.clone(),
+                    iterations: iteration,
+                    repair_log: repair_log.clone(),
+                };
+                let report = ReportBuilder::build(
+                    input_file, output_file, original_c, &current_code,
+                    iteration, self.max_iterations, true,
+                    result.errors.len(), result.warnings.len(),
+                    repair_log, semantic_summary, validation_warnings,
+                );
+                self.cleanup();
+                return Ok((outcome, report));
+            }
+
+            let error_count = result.errors.len();
+            println!("  ⚠  {} error(s) found.", error_count);
+
+            // Check for convergence failure (no improvement)
+            if error_count >= last_error_count {
+                no_progress_count += 1;
+            } else {
+                no_progress_count = 0;
+            }
+            last_error_count = error_count;
+
+            if no_progress_count >= 3 {
+                println!("  ✗ Convergence failure – repairs are not reducing error count.");
+                let outcome = LoopOutcome::ConvergenceFailure {
+                    code: current_code.clone(),
+                    message: "Error count stopped decreasing after 3 consecutive iterations".into(),
+                    repair_log: repair_log.clone(),
+                };
+                let report = ReportBuilder::build(
+                    input_file, output_file, original_c, &current_code,
+                    iteration, self.max_iterations, false,
+                    error_count, result.warnings.len(),
+                    repair_log, semantic_summary, validation_warnings,
+                );
+                self.cleanup();
+                return Ok((outcome, report));
+            }
+
+            // Print top errors (verbose)
+            for (i, err) in result.errors.iter().take(3).enumerate() {
+                let code = err.error_code().unwrap_or("?");
+                println!("     {}. [{}] {}", i + 1, code, &err.message[..err.message.len().min(80)]);
+            }
+
+            // 0.5.2: Repair
+            println!("  🔧 Applying repair strategies...");
+            let all_diags: Vec<_> = result.errors.iter()
+                .chain(result.warnings.iter())
+                .cloned()
+                .collect();
+
+            let (repaired, actions) = RepairEngine::repair(&current_code, &all_diags)?;
+
+            if actions.is_empty() {
+                println!("  ✗ No applicable repairs found – stopping.");
+                let outcome = LoopOutcome::ConvergenceFailure {
+                    code: current_code.clone(),
+                    message: "No repair rules matched the remaining diagnostics".into(),
+                    repair_log: repair_log.clone(),
+                };
+                let report = ReportBuilder::build(
+                    input_file, output_file, original_c, &current_code,
+                    iteration, self.max_iterations, false,
+                    error_count, result.warnings.len(),
+                    repair_log, semantic_summary, validation_warnings,
+                );
+                self.cleanup();
+                return Ok((outcome, report));
+            }
+
+            for action in &actions {
+                println!("     ✓ {}: {}", action.rule_name, action.description);
+                repair_log.push(RepairLogEntry {
+                    iteration,
+                    rule_name: action.rule_name.clone(),
+                    description: action.description.clone(),
+                });
+            }
+
+            current_code = repaired;
+        }
+
+        // Max iterations reached
+        println!("  ✗ Maximum iterations ({}) reached.", self.max_iterations);
+        let final_result = self.compile(&current_code)?;
+        let outcome = LoopOutcome::MaxIterationsReached {
+            best_code: current_code.clone(),
+            last_error_count: final_result.errors.len(),
+            iterations: self.max_iterations,
+            repair_log: repair_log.clone(),
+        };
+        let report = ReportBuilder::build(
+            input_file, output_file, original_c, &current_code,
+            self.max_iterations, self.max_iterations,
+            final_result.success,
+            final_result.errors.len(), final_result.warnings.len(),
+            repair_log, semantic_summary, validation_warnings,
+        );
+        self.cleanup();
+        Ok((outcome, report))
+    }
+
+    // ── 0.5.1: Compile ────────────────────────────────────────────────────────
+
+    fn compile(&self, code: &str) -> Result<CompilationResult> {
+        let rust_file = self.temp_dir.join("diagrust_temp.rs");
         std::fs::write(&rust_file, code)
             .context("Failed to write temporary Rust file")?;
-        
-        // Run rustc with JSON output
+
         let output = Command::new("rustc")
-            .arg("--crate-type")
-            .arg("lib")
+            .arg("--crate-type=lib")
             .arg("--error-format=json")
+            .arg("--edition=2021")
             .arg(&rust_file)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .context("Failed to run rustc")?;
-        
-        let success = output.status.success();
-        
-        // Parse diagnostics from stderr
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let (errors, warnings) = self.parse_diagnostics(&stderr)?;
-        
+            .context("Failed to invoke rustc")?;
+
+        let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let (errors, warnings) = DiagnosticParser::parse(&raw_stderr);
+
         Ok(CompilationResult {
-            success,
+            success: output.status.success(),
             errors,
             warnings,
+            raw_stderr,
         })
     }
-    
-    fn parse_diagnostics(&self, output: &str) -> Result<(Vec<RustcDiagnostic>, Vec<RustcDiagnostic>)> {
-        let mut errors = Vec::new();
-        let mut warnings = Vec::new();
-        
-        for line in output.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            
-            // Try to parse as JSON diagnostic
-            if let Ok(diag) = serde_json::from_str::<RustcDiagnostic>(line) {
-                match diag.level.as_str() {
-                    "error" => errors.push(diag),
-                    "warning" => warnings.push(diag),
-                    _ => {}
-                }
-            }
-        }
-        
-        Ok((errors, warnings))
+
+    fn rustc_available(&self) -> bool {
+        Command::new("rustc")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
-    
-    /// Basic repair suggestions (MVP - simple text replacements)
-    pub fn suggest_repairs(&self, code: &str, errors: &[RustcDiagnostic]) -> Result<Option<String>> {
-        let mut repaired_code = code.to_string();
-        let mut repairs_applied = false;
-        
-        for error in errors {
-            // Get error code if available
-            let error_code = error.code.as_ref().map(|c| c.code.as_str());
-            
-            // Repair Rule 1: Rust keyword collision
-            if error.message.contains("expected identifier, found keyword") {
-                // Extract the keyword from error message
-                if let Some(keyword) = Self::extract_keyword_from_message(&error.message) {
-                    println!("   🔧 Repair: Renaming Rust keyword '{}' to '{}_val'", keyword, keyword);
-                    
-                    // Replace variable declarations with keyword
-                    let pattern = format!(r"let {}: ", keyword);
-                    let replacement = format!("let {}_val: ", keyword);
-                    repaired_code = repaired_code.replace(&pattern, &replacement);
-                    
-                    // Replace variable uses
-                    let pattern = format!(r"return {};", keyword);
-                    let replacement = format!("return {}_val;", keyword);
-                    repaired_code = repaired_code.replace(&pattern, &replacement);
-                    
-                    repairs_applied = true;
-                }
-            }
-            
-            // Repair Rule 2: Type mismatch - bool assigned to i32
-            if let Some("E0308") = error_code {
-                if error.message.contains("expected `i32`, found `bool`") 
-                    || error.message.contains("mismatched types") {
-                    println!("   🔧 Repair: Converting bool comparison to i32");
-                    
-                    // Find pattern: let var: i32 = comparison;
-                    let bool_pattern = regex::Regex::new(
-                        r"let (\w+): i32 = ([^;]+[<>]=?[^;]+);"
-                    ).unwrap();
-                    
-                    if let Some(cap) = bool_pattern.captures(&repaired_code) {
-                        let var_name = &cap[1];
-                        let comparison = &cap[2];
-                        let replacement = format!(
-                            "let {}: i32 = if {} {{ 1 }} else {{ 0 }};",
-                            var_name, comparison
-                        );
-                        repaired_code = bool_pattern.replace(&repaired_code, replacement).to_string();
-                        repairs_applied = true;
-                    }
-                }
-            }
-            
-            // Repair Rule 3: Unused variable warning
-            if error.message.contains("unused variable") || error.message.contains("never read") {
-                // Extract variable name
-                if let Some(var_name) = Self::extract_variable_from_message(&error.message) {
-                    println!("   🔧 Repair: Prefixing unused variable '{}' with '_'", var_name);
-                    
-                    let pattern = format!("let {}: ", var_name);
-                    let replacement = format!("let _{}: ", var_name);
-                    repaired_code = repaired_code.replace(&pattern, &replacement);
-                    repairs_applied = true;
-                }
-            }
-            
-            // Repair Rule 5: Array indexed by i32 instead of usize (E0277)
-            if let Some("E0277") = error_code {
-                if error.message.contains("cannot be indexed by `i32`")
-                    || error.message.contains("cannot be indexed by") {
-                    println!("   🔧 Repair: Adding `as usize` casts on array indices");
 
-                    // Replace patterns like arr[expr] where expr is not already usize
-                    // We replace `arr[<anything not containing as usize>]`
-                    let idx_pattern = regex::Regex::new(
-                        r"\[([^\[\]]+)\]"
-                    ).unwrap();
-
-                    let new_code = idx_pattern.replace_all(&repaired_code, |caps: &regex::Captures| {
-                        let inner = &caps[1];
-                        // Skip if already has usize cast or is a plain literal
-                        if inner.contains("as usize") || inner.parse::<usize>().is_ok() {
-                            format!("[{}]", inner)
-                        } else {
-                            format!("[({}) as usize]", inner)
-                        }
-                    }).to_string();
-
-                    if new_code != repaired_code {
-                        repaired_code = new_code;
-                        repairs_applied = true;
-                    }
-                }
-            }
-
-            // Repair Rule 4: Missing return statement
-            if error.message.contains("mismatched types") && error.message.contains("expected `()`") {
-                if !repaired_code.contains("return;") {
-                    println!("   🔧 Repair: Adding missing return statement");
-                    // Add return; before closing brace
-                    if let Some(pos) = repaired_code.rfind('}') {
-                        repaired_code.insert_str(pos, "    return;\n");
-                        repairs_applied = true;
-                    }
-                }
-            }
-        }
-        
-        if repairs_applied {
-            Ok(Some(repaired_code))
-        } else {
-            Ok(None)
-        }
+    fn cleanup(&self) {
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
     }
-    
-    fn extract_keyword_from_message(message: &str) -> Option<String> {
-        // Pattern: "expected identifier, found keyword `mod`"
-        let pattern = regex::Regex::new(r"found keyword `(\w+)`").unwrap();
-        pattern.captures(message)
-            .and_then(|cap| cap.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-    
-    fn extract_variable_from_message(message: &str) -> Option<String> {
-        // Pattern: "unused variable: `result`"
-        let pattern = regex::Regex::new(r"variable:?\s+`(\w+)`").unwrap();
-        pattern.captures(message)
-            .and_then(|cap| cap.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-}
 
-/// Simple metrics collector
-#[derive(Debug, Default)]
-pub struct TranslationMetrics {
-    pub compilation_success: bool,
-    pub error_count: usize,
-    pub warning_count: usize,
-    pub iterations_needed: usize,
-}
+    /// Compatibility method – compile a code string directly (used by CLI for single-shot check).
+    pub fn compile_rust_code(&self, code: &str, temp_dir: &Path) -> Result<CompilationResult> {
+        let rust_file = temp_dir.join("diagrust_temp.rs");
+        std::fs::write(&rust_file, code)?;
 
-impl TranslationMetrics {
-    pub fn from_result(result: &CompilationResult, iterations: usize) -> Self {
-        Self {
-            compilation_success: result.success,
-            error_count: result.errors.len(),
-            warning_count: result.warnings.len(),
-            iterations_needed: iterations,
-        }
-    }
-    
-    pub fn to_report(&self) -> String {
-        format!(
-            "Translation Metrics:\n\
-             - Compilation: {}\n\
-             - Errors: {}\n\
-             - Warnings: {}\n\
-             - Iterations: {}",
-            if self.compilation_success { "SUCCESS" } else { "FAILED" },
-            self.error_count,
-            self.warning_count,
-            self.iterations_needed
-        )
+        let output = Command::new("rustc")
+            .arg("--crate-type=lib")
+            .arg("--error-format=json")
+            .arg("--edition=2021")
+            .arg(&rust_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .context("Failed to invoke rustc")?;
+
+        let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let (errors, warnings) = DiagnosticParser::parse(&raw_stderr);
+
+        Ok(CompilationResult {
+            success: output.status.success(),
+            errors,
+            warnings,
+            raw_stderr,
+        })
     }
 }

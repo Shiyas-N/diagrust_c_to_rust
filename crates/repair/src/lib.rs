@@ -206,20 +206,46 @@ impl RepairEngine {
 
     fn repair_keyword_collision(code: &str, keyword: &str) -> (String, bool) {
         let new_name = format!("{}_val", keyword);
-        let patterns = [
-            (format!("let {}: ", keyword),    format!("let {}: ", new_name)),
-            (format!("let mut {}: ", keyword), format!("let mut {}: ", new_name)),
-            (format!("return {};", keyword),   format!("return {};", new_name)),
-            (format!(" {};", keyword),         format!(" {};", new_name)),
-        ];
+        let patterns: &[(&str, &str)] = &[];  // placeholder; built dynamically below
+        let _ = patterns;
+
         let mut result = code.to_string();
         let mut changed = false;
-        for (from, to) in &patterns {
+
+        // Build all replacement patterns
+        let replacements: Vec<(String, String)> = vec![
+            // Variable declarations
+            (format!("let {}: ", keyword),         format!("let {}: ", new_name)),
+            (format!("let mut {}: ", keyword),     format!("let mut {}: ", new_name)),
+            // Return statement
+            (format!("return {};", keyword),        format!("return {};", new_name)),
+            (format!(" {};", keyword),              format!(" {};", new_name)),
+            // Function signature parameters: (keyword: type) and (mut keyword: type)
+            (format!("({}: ", keyword),             format!("({}: ", new_name)),
+            (format!("(mut {}: ", keyword),         format!("(mut {}: ", new_name)),
+            (format!(", {}: ", keyword),            format!(", {}: ", new_name)),
+            (format!(", mut {}: ", keyword),        format!(", mut {}: ", new_name)),
+        ];
+
+        for (from, to) in &replacements {
             if result.contains(from.as_str()) {
                 result = result.replace(from.as_str(), to.as_str());
                 changed = true;
             }
         }
+
+        // Replace remaining uses in expression context (space-delimited word boundaries)
+        for suffix in &[" ", ";", ")", ",", "+", "-", "*", "/", "%", "="] {
+            for prefix in &[" ", "(", "=", "+", "-", "*", "/", "%", ","] {
+                let from = format!("{}{}{}", prefix, keyword, suffix);
+                let to   = format!("{}{}{}", prefix, new_name, suffix);
+                if result.contains(&from) {
+                    result = result.replace(&from, &to);
+                    changed = true;
+                }
+            }
+        }
+
         (result, changed)
     }
 

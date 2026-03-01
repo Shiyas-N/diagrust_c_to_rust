@@ -39,9 +39,7 @@ DIAGRUST translates C source code to idiomatic, memory-safe Rust by:\n\
   3. Running semantic analysis (def-use chains, alias analysis, ownership inference)\n\
   4. Building a typed Intermediate Representation\n\
   5. Generating idiomatic Rust code\n\
-  6. Iteratively compiling and repairing via rustc diagnostics\n\
-\n\
-Department of Computer Applications (MCA), GEC Thrissur – March 2026"
+  6. Iteratively compiling and repairing via rustc diagnostics "
 )]
 struct Args {
     /// Input C source file (.c)
@@ -312,8 +310,8 @@ fn translate_file(
 fn print_banner() {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  🦀 DIAGRUST  –  Compiler-in-the-Loop Rust Transpiler        ║");
-    println!("║     Department of Computer Applications (MCA), GEC Thrissur  ║");
-    println!("║     Muhammed Shiyas N (TCR24MCA-2043) · March 2026           ║");
+    // println!("║     Department of Computer Applications (MCA), GEC Thrissur  ║");
+    // println!("║     Muhammed Shiyas N (TCR24MCA-2043) · March 2026           ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 }

@@ -504,9 +504,30 @@ impl SimpleParser {
         if params_str.trim().is_empty() || params_str.trim() == "void" {
             return Ok(parameters);
         }
+
+        // Regex to match pointer params: "int *x", "int* x", "int **pp"
+        let ptr_re = regex::Regex::new(
+            r"^\s*(int|char|float|double)\s*(\*+)\s*(\w+)\s*$"
+        ).unwrap();
         
         for param in params_str.split(',') {
-            let parts: Vec<&str> = param.trim().split_whitespace().collect();
+            let p = param.trim();
+
+            // Pointer parameter: int *x, int* x, int **pp
+            if let Some(cap) = ptr_re.captures(p) {
+                let base_type = Self::parse_type(&cap[1]);
+                let stars = cap[2].len();
+                let name = cap[3].to_string();
+                let mut param_type = base_type;
+                for _ in 0..stars {
+                    param_type = CType::Pointer(Box::new(param_type));
+                }
+                parameters.push(CParameter { name, param_type });
+                continue;
+            }
+
+            // Normal parameter: int x, float y
+            let parts: Vec<&str> = p.split_whitespace().collect();
             if parts.len() >= 2 {
                 let param_type = Self::parse_type(parts[0]);
                 let name = parts[1].trim_end_matches(';').to_string();
@@ -599,15 +620,29 @@ impl SimpleParser {
     // 0.5️⃣ Parenthesized expression: strip outer parens
     // ===============================
     if expr.starts_with('(') && expr.ends_with(')') {
-        // Make sure the parens match each other (not a cast like (int)x)
-        let inner = &expr[1..expr.len()-1];
-        // Check if this is a type cast: (int), (float), etc.
-        let cast_types = ["int", "float", "double", "char", "long", "unsigned int", "unsigned"];
-        if cast_types.iter().any(|t| inner.trim() == *t) {
-            // It's a cast prefix but no operand — skip, handle below
-        } else {
-            // Recursively parse inner
-            return Self::parse_expression(inner);
+        // Verify the opening '(' pairs with the LAST ')' — not e.g. (float)(a+b)
+        let mut depth = 0i32;
+        let mut first_close_pos = expr.len(); // position where depth first hits 0
+        for (i, ch) in expr.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 { first_close_pos = i; break; }
+                }
+                _ => {}
+            }
+        }
+        // Only strip outer parens when the first '(' pairs with the very last ')'
+        if first_close_pos == expr.len() - 1 {
+            let inner = &expr[1..expr.len()-1];
+            // Skip if inner is a bare type name (cast prefix with no operand)
+            let cast_types = ["int", "float", "double", "char", "long", "unsigned int", "unsigned"];
+            if cast_types.iter().any(|t| inner.trim() == *t) {
+                // It's a cast prefix but no operand — skip, handle below
+            } else {
+                return Self::parse_expression(inner);
+            }
         }
     }
 
@@ -711,10 +746,32 @@ impl SimpleParser {
         let right = Self::parse_expression(&expr[pos+1..])?;
         return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Sub, right: Box::new(right) });
     }
-    if let Some(pos) = find_operator_outside_parens(expr, "*") {
-        let left = Self::parse_expression(&expr[..pos])?;
-        let right = Self::parse_expression(&expr[pos+1..])?;
-        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Mul, right: Box::new(right) });
+    // Binary multiply: scan for * with non-empty left side (skip unary deref at pos 0)
+    {
+        let bytes = expr.as_bytes();
+        let mut dp = 0i32; // depth paren
+        let mut db = 0i32; // depth bracket
+        let mut found_mul: Option<usize> = None;
+        let mut i = 0usize;
+        while i < expr.len() {
+            match bytes[i] {
+                b'(' => { dp += 1; i += 1; continue; }
+                b')' => { dp -= 1; i += 1; continue; }
+                b'[' => { db += 1; i += 1; continue; }
+                b']' => { db -= 1; i += 1; continue; }
+                _ => {}
+            }
+            if dp == 0 && db == 0 && bytes[i] == b'*' && i > 0 && !expr[..i].trim().is_empty() {
+                found_mul = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        if let Some(pos) = found_mul {
+            let left = Self::parse_expression(&expr[..pos])?;
+            let right = Self::parse_expression(&expr[pos+1..])?;
+            return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Mul, right: Box::new(right) });
+        }
     }
     if let Some(pos) = find_operator_outside_parens(expr, "/") {
         let left = Self::parse_expression(&expr[..pos])?;
@@ -728,7 +785,7 @@ impl SimpleParser {
     }
 
     // ===============================
-    // 8️⃣ Unary minus
+    // 8️⃣ Unary operators
     // ===============================
     if expr.starts_with('-') {
         let operand = Self::parse_expression(&expr[1..])?;
@@ -737,6 +794,11 @@ impl SimpleParser {
     if expr.starts_with('!') {
         let operand = Self::parse_expression(&expr[1..])?;
         return Ok(CExpression::UnaryOp { op: UnaryOp::Not, operand: Box::new(operand) });
+    }
+    // Unary dereference: *x, **pp
+    if expr.starts_with('*') {
+        let operand = Self::parse_expression(&expr[1..])?;
+        return Ok(CExpression::UnaryOp { op: UnaryOp::Deref, operand: Box::new(operand) });
     }
 
     // ===============================
@@ -780,6 +842,13 @@ impl SimpleParser {
     }
     if let Ok(num) = expr.parse::<f64>() {
         return Ok(CExpression::Literal(CLiteral::Float(num)));
+    }
+    // C float literals with suffix: 1.8f, 32.0F, 3.14l, 3.14L
+    if expr.ends_with(|c: char| c == 'f' || c == 'F' || c == 'l' || c == 'L') {
+        let stripped = &expr[..expr.len()-1];
+        if let Ok(num) = stripped.parse::<f64>() {
+            return Ok(CExpression::Literal(CLiteral::Float(num)));
+        }
     }
     if expr.starts_with('\'') && expr.ends_with('\'') && expr.len() >= 3 {
         let ch = expr.chars().nth(1).unwrap_or('\0');
@@ -967,8 +1036,49 @@ impl SimpleParser {
     }
 
     /// Parse the increment part of a for loop
+    /// Parse the increment part of a for loop
     pub fn parse_for_increment(inc: &str) -> Result<CExpression> {
-        Self::parse_expression(inc)
+        let trimmed = inc.trim();
+
+        // Helper closure to build: var = var OP 1
+        macro_rules! inc_expr {
+            ($var:expr, $op:expr) => {{
+                let var = $var.to_string();
+                let rhs = CExpression::BinaryOp {
+                    left: Box::new(CExpression::Variable(var.clone())),
+                    op: $op,
+                    right: Box::new(CExpression::Literal(CLiteral::Int(1))),
+                };
+                CExpression::BinaryOp {
+                    left: Box::new(CExpression::Variable(var)),
+                    op: BinOp::Assign,
+                    right: Box::new(rhs),
+                }
+            }};
+        }
+
+        // Postfix: i++
+        if trimmed.ends_with("++") && !trimmed.starts_with("++") {
+            let var = trimmed.trim_end_matches("++").trim();
+            return Ok(inc_expr!(var, BinOp::Add));
+        }
+        // Postfix: i--
+        if trimmed.ends_with("--") && !trimmed.starts_with("--") {
+            let var = trimmed.trim_end_matches("--").trim();
+            return Ok(inc_expr!(var, BinOp::Sub));
+        }
+        // Prefix: ++i
+        if trimmed.starts_with("++") {
+            let var = trimmed.trim_start_matches("++").trim();
+            return Ok(inc_expr!(var, BinOp::Add));
+        }
+        // Prefix: --i
+        if trimmed.starts_with("--") {
+            let var = trimmed.trim_start_matches("--").trim();
+            return Ok(inc_expr!(var, BinOp::Sub));
+        }
+
+        Self::parse_expression(trimmed)
     }
 }
 

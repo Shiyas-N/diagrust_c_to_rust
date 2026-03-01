@@ -39,7 +39,7 @@ DIAGRUST translates C source code to idiomatic, memory-safe Rust by:\n\
   3. Running semantic analysis (def-use chains, alias analysis, ownership inference)\n\
   4. Building a typed Intermediate Representation\n\
   5. Generating idiomatic Rust code\n\
-  6. Iteratively compiling and repairing via rustc diagnostics "
+  6. Iteratively compiling and repairing via rustc diagnostics"
 )]
 struct Args {
     /// Input C source file (.c)

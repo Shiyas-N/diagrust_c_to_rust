@@ -161,6 +161,11 @@ impl TypeMapper {
             CType::Float => Some("f32".to_string()),
             CType::Double => Some("f64".to_string()),
             CType::Void => Some("()".to_string()),
+            // Nested pointer: int** → &mut i32 (inner of outer pointer)
+            CType::Pointer(inner) => {
+                let inner_str = Self::c_primitive_str(inner).unwrap_or_else(|| "u8".to_string());
+                Some(format!("&mut {}", inner_str))
+            }
             _ => None,
         }
     }

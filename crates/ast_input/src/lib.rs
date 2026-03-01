@@ -649,14 +649,80 @@ impl SimpleParser {
     // ===============================
     // 1️⃣ Type cast: (int)expr, (float)expr
     // ===============================
-    let cast_re = regex::Regex::new(r"^\((int|float|double|char|long)\)(.+)$").unwrap();
-    if let Some(cap) = cast_re.captures(expr) {
+    // Match cast prefix: (type) followed by something
+    let cast_prefix_re = regex::Regex::new(r"^\((int|float|double|char|long)\)(.+)$").unwrap();
+    if let Some(cap) = cast_prefix_re.captures(expr) {
         let to_type = Self::parse_type(&cap[1]);
-        let inner = Self::parse_expression(&cap[2])?;
-        return Ok(CExpression::Cast {
-            to_type,
-            expr: Box::new(inner),
-        });
+        let after_cast = cap[2].trim();
+        let type_end = cap.get(1).unwrap().end() + 1; // position after ')'
+
+        // Find where the immediate cast operand ends.
+        // The cast binds tighter than binary ops, so (double)x * y = ((double)x) * y
+        // We extract just the first "atom": a parenthesized group OR a word token.
+        let cast_operand_end = if after_cast.starts_with('(') {
+            // Find matching close paren
+            let mut depth = 0i32;
+            let mut end = 0usize;
+            for (i, ch) in after_cast.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 { end = i + 1; break; }
+                    }
+                    _ => {}
+                }
+            }
+            end
+        } else {
+            // Take up to next operator or end of string
+            let mut end = after_cast.len();
+            let bytes = after_cast.as_bytes();
+            for i in 0..bytes.len() {
+                if bytes[i] == b' ' || bytes[i] == b'+' || bytes[i] == b'-'
+                    || bytes[i] == b'*' || bytes[i] == b'/' || bytes[i] == b'%'
+                    || bytes[i] == b'<' || bytes[i] == b'>' || bytes[i] == b'='
+                    || bytes[i] == b'&' || bytes[i] == b'|' {
+                    end = i;
+                    break;
+                }
+            }
+            end
+        };
+
+        let cast_operand = &after_cast[..cast_operand_end];
+        let rest = after_cast[cast_operand_end..].trim();
+
+        let cast_inner = Self::parse_expression(cast_operand)?;
+        let cast_expr = CExpression::Cast { to_type, expr: Box::new(cast_inner) };
+
+        if rest.is_empty() {
+            // Simple cast: (float)x
+            return Ok(cast_expr);
+        } else {
+            // Cast followed by binary op: (double)x * factor
+            // Re-parse as: cast_expr OP rest
+            let full = format!("__CAST__ {}", rest);
+            // Build BinaryOp manually by prepending cast result
+            // We synthesize the full expression with a placeholder and parse the rest
+            let rhs_expr = Self::parse_expression(rest.trim_start_matches(|c: char| {
+                c == '*' || c == '/' || c == '+' || c == '-' || c == '%' || c == ' '
+            }))?;
+            let op_char = rest.chars().next().unwrap_or('+');
+            let op = match op_char {
+                '+' => BinOp::Add,
+                '-' => BinOp::Sub,
+                '*' => BinOp::Mul,
+                '/' => BinOp::Div,
+                '%' => BinOp::Mod,
+                _ => BinOp::Add,
+            };
+            return Ok(CExpression::BinaryOp {
+                left: Box::new(cast_expr),
+                op,
+                right: Box::new(rhs_expr),
+            });
+        }
     }
 
     // ===============================

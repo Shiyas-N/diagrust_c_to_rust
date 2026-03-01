@@ -116,11 +116,11 @@ impl OwnershipInferrer {
                 }
             }
             StorageClass::Parameter => {
-                if has_aliases || addr_taken {
-                    OwnershipKind::MutableBorrow
-                } else {
-                    OwnershipKind::ImmutableBorrow
-                }
+                // In C, int *x as a parameter means the caller wants us to
+                // read AND write through the pointer — always &mut T in Rust.
+                // Only downgrade to &T if we can prove no writes through it,
+                // but we conservatively use &mut for all pointer parameters.
+                OwnershipKind::MutableBorrow
             }
             StorageClass::Stack => {
                 if addr_taken && has_aliases {

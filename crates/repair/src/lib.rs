@@ -103,6 +103,21 @@ impl RepairEngine {
                 }
             }
 
+            // ── Cannot assign through shared ref (E0594) ─────────────────────
+            // e.g. "cannot assign to `*x`, which is behind a `&` reference"
+            // Fix: change the parameter type from `&T` to `&mut T`
+            if matches!(err_code, Some("E0594")) || diag.message.contains("cannot assign to") && diag.message.contains("behind a `&` reference") {
+                let (repaired, changed) = Self::repair_immutable_ref(&current, diag);
+                if changed {
+                    current = repaired;
+                    actions.push(RepairAction {
+                        rule_name: "ImmutableRef".into(),
+                        description: format!("Upgraded & to &mut for pointer parameter: {}", diag.message),
+                        applied: true,
+                    });
+                }
+            }
+
             // ── Missing `mut` (E0596) ─────────────────────────────────────────
             if matches!(err_code, Some("E0596")) || diag.message.contains("cannot borrow") && diag.message.contains("as mutable") {
                 let (repaired, changed) = Self::repair_add_mut(&current, diag);
@@ -247,6 +262,24 @@ impl RepairEngine {
         }
 
         (result, changed)
+    }
+
+    fn repair_immutable_ref(code: &str, diag: &RustcDiagnostic) -> (String, bool) {
+        // Extract variable name from message: "cannot assign to `*x`, which is behind a `&` reference"
+        let re = Regex::new(r"cannot assign to `\*(\w+)`").unwrap();
+        if let Some(cap) = re.captures(&diag.message) {
+            let var = &cap[1];
+            // Replace `var: &T` with `var: &mut T` in function signature
+            // Patterns: "var: &i32", "var: &f32", "var: &u8", etc.
+            let ref_re = Regex::new(&format!(r"(\b{}\s*:\s*)&(\w)", regex::escape(var))).unwrap();
+            if ref_re.is_match(code) {
+                let repaired = ref_re.replace_all(code, format!("${{1}}&mut $2")).to_string();
+                if repaired != code {
+                    return (repaired, true);
+                }
+            }
+        }
+        (code.to_string(), false)
     }
 
     fn repair_add_mut(code: &str, diag: &RustcDiagnostic) -> (String, bool) {

@@ -59,6 +59,7 @@ pub enum CType {
     Float,
     Double,
     Pointer(Box<CType>),
+    Array(Box<CType>, Option<usize>), // base_type, optional_size
     Unknown(String),
 }
 
@@ -67,10 +68,13 @@ pub enum CStatement {
     Return(Option<CExpression>),
     VarDecl { name: String, var_type: CType, init: Option<CExpression> },
     Assignment { target: String, value: CExpression },
+    IndexedAssignment { array: String, index: CExpression, value: CExpression }, // NEW: arr[i] = val
     Expression(CExpression),
     If { condition: CExpression, then_body: Vec<CStatement>, else_body: Option<Vec<CStatement>> },
     While { condition: CExpression, body: Vec<CStatement> },
     For { init: Box<CStatement>, condition: CExpression, increment: CExpression, body: Vec<CStatement> },
+    Break,    // NEW
+    Continue, // NEW
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +84,9 @@ pub enum CExpression {
     BinaryOp { left: Box<CExpression>, op: BinOp, right: Box<CExpression> },
     UnaryOp { op: UnaryOp, operand: Box<CExpression> },
     Call { function: String, args: Vec<CExpression> },
+    ArrayAccess { array: Box<CExpression>, index: Box<CExpression> }, // NEW: arr[i]
+    ArrayLiteral(Vec<CExpression>), // NEW: {1, 2, 3}
+    Cast { to_type: CType, expr: Box<CExpression> }, // NEW: (int)x
     Null,
 }
 
@@ -359,13 +366,19 @@ impl InputValidator {
         for (line_num, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
             
-            // Check for function declarations without body
-            if (trimmed.contains("int ") || trimmed.contains("void ") || trimmed.contains("float ") || trimmed.contains("char "))
-                && trimmed.contains('(') && trimmed.contains(')') && trimmed.ends_with(';') {
-                return Err(ValidationError::SyntaxError {
-                    line: line_num + 1,
-                    message: format!("Function declaration without definition (forward declaration not supported): '{}'", trimmed),
-                });
+            // Check for function declarations without body.
+            // Uses regex to avoid false positives like: int mid = (a + b) / 2;
+            // A real forward declaration must be: `type name(params);` with no `=`.
+            {
+                let fwd_re = regex::Regex::new(
+                    r"^(int|void|float|double|char)\s+\w+\s*\([^)]*\)\s*;$"
+                ).unwrap();
+                if fwd_re.is_match(trimmed) && !trimmed.contains('=') {
+                    return Err(ValidationError::SyntaxError {
+                        line: line_num + 1,
+                        message: format!("Function declaration without definition (forward declaration not supported): '{}'", trimmed),
+                    });
+                }
             }
             
             // FIXED: Check for missing return in non-void functions
@@ -461,8 +474,21 @@ impl SimpleParser {
     Ok(CProgram { functions })
 }
     
-    fn parse_type(type_str: &str) -> CType {
-        match type_str.trim() {
+    pub fn parse_type(type_str: &str) -> CType {
+        let s = type_str.trim();
+        // Array: int[5] or int[]
+        let arr_re = regex::Regex::new(r"^(int|char|float|double|void)\[(\d*)\]$").unwrap();
+        if let Some(cap) = arr_re.captures(s) {
+            let base = Self::parse_type(&cap[1]);
+            let size = cap[2].parse::<usize>().ok();
+            return CType::Array(Box::new(base), size);
+        }
+        // Pointer: int*
+        if s.ends_with('*') {
+            let inner = Self::parse_type(&s[..s.len()-1]);
+            return CType::Pointer(Box::new(inner));
+        }
+        match s {
             "void" => CType::Void,
             "int" => CType::Int,
             "char" => CType::Char,
@@ -563,158 +589,220 @@ impl SimpleParser {
     let expr = expr_str.trim();
 
     // ===============================
-    // 1️⃣ Assignment (standalone '=' only)
+    // 0️⃣ Empty
     // ===============================
-    if let Some(eq_pos) = expr.find('=') {
-        let prev = expr.chars().nth(eq_pos.wrapping_sub(1));
-        let next = expr.chars().nth(eq_pos + 1);
-
-        let is_comparison =
-            prev == Some('<') ||
-            prev == Some('>') ||
-            prev == Some('!') ||
-            next == Some('=');
-
-        if !is_comparison {
-            let left = Self::parse_expression(expr[..eq_pos].trim())?;
-            let right = Self::parse_expression(expr[eq_pos + 1..].trim())?;
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::Assign,
-                right: Box::new(right),
-            });
-        }
+    if expr.is_empty() {
+        return Ok(CExpression::Null);
     }
 
     // ===============================
-    // 2️⃣ Equality operators
+    // 0.5️⃣ Parenthesized expression: strip outer parens
     // ===============================
-
-    if expr.contains("==") {
-        let parts: Vec<&str> = expr.splitn(2, "==").collect();
-        if parts.len() == 2 {
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(Self::parse_expression(parts[0].trim())?),
-                op: BinOp::Equal,
-                right: Box::new(Self::parse_expression(parts[1].trim())?),
-            });
-        }
-    }
-
-    if expr.contains("!=") {
-        let parts: Vec<&str> = expr.splitn(2, "!=").collect();
-        if parts.len() == 2 {
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(Self::parse_expression(parts[0].trim())?),
-                op: BinOp::NotEqual,
-                right: Box::new(Self::parse_expression(parts[1].trim())?),
-            });
+    if expr.starts_with('(') && expr.ends_with(')') {
+        // Make sure the parens match each other (not a cast like (int)x)
+        let inner = &expr[1..expr.len()-1];
+        // Check if this is a type cast: (int), (float), etc.
+        let cast_types = ["int", "float", "double", "char", "long", "unsigned int", "unsigned"];
+        if cast_types.iter().any(|t| inner.trim() == *t) {
+            // It's a cast prefix but no operand — skip, handle below
+        } else {
+            // Recursively parse inner
+            return Self::parse_expression(inner);
         }
     }
 
     // ===============================
-    // 3️⃣ Relational operators (longest first)
+    // 1️⃣ Type cast: (int)expr, (float)expr
     // ===============================
-
-    if expr.contains("<=") {
-        let parts: Vec<&str> = expr.splitn(2, "<=").collect();
-        if parts.len() == 2 {
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(Self::parse_expression(parts[0].trim())?),
-                op: BinOp::LessEq,
-                right: Box::new(Self::parse_expression(parts[1].trim())?),
-            });
-        }
-    }
-
-    if expr.contains(">=") {
-        let parts: Vec<&str> = expr.splitn(2, ">=").collect();
-        if parts.len() == 2 {
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(Self::parse_expression(parts[0].trim())?),
-                op: BinOp::GreaterEq,
-                right: Box::new(Self::parse_expression(parts[1].trim())?),
-            });
-        }
-    }
-
-    if expr.contains('<') {
-        let parts: Vec<&str> = expr.splitn(2, '<').collect();
-        if parts.len() == 2 {
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(Self::parse_expression(parts[0].trim())?),
-                op: BinOp::Less,
-                right: Box::new(Self::parse_expression(parts[1].trim())?),
-            });
-        }
-    }
-
-    if expr.contains('>') {
-        let parts: Vec<&str> = expr.splitn(2, '>').collect();
-        if parts.len() == 2 {
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(Self::parse_expression(parts[0].trim())?),
-                op: BinOp::Greater,
-                right: Box::new(Self::parse_expression(parts[1].trim())?),
-            });
-        }
+    let cast_re = regex::Regex::new(r"^\((int|float|double|char|long)\)(.+)$").unwrap();
+    if let Some(cap) = cast_re.captures(expr) {
+        let to_type = Self::parse_type(&cap[1]);
+        let inner = Self::parse_expression(&cap[2])?;
+        return Ok(CExpression::Cast {
+            to_type,
+            expr: Box::new(inner),
+        });
     }
 
     // ===============================
-    // 4️⃣ Arithmetic
+    // 2️⃣ Array literal: {1, 2, 3}
     // ===============================
-
-    if expr.contains('+') {
-        let parts: Vec<&str> = expr.splitn(2, '+').collect();
-        if parts.len() == 2 {
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(Self::parse_expression(parts[0].trim())?),
-                op: BinOp::Add,
-                right: Box::new(Self::parse_expression(parts[1].trim())?),
-            });
-        }
-    }
-
-    if expr.contains('-') && !expr.starts_with('-') {
-        let parts: Vec<&str> = expr.splitn(2, '-').collect();
-        if parts.len() == 2 {
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(Self::parse_expression(parts[0].trim())?),
-                op: BinOp::Sub,
-                right: Box::new(Self::parse_expression(parts[1].trim())?),
-            });
-        }
-    }
-
-    if expr.contains('*') {
-        let parts: Vec<&str> = expr.splitn(2, '*').collect();
-        if parts.len() == 2 {
-            return Ok(CExpression::BinaryOp {
-                left: Box::new(Self::parse_expression(parts[0].trim())?),
-                op: BinOp::Mul,
-                right: Box::new(Self::parse_expression(parts[1].trim())?),
-            });
-        }
+    if expr.starts_with('{') && expr.ends_with('}') {
+        let inner = &expr[1..expr.len()-1];
+        let elements: Result<Vec<CExpression>> = inner
+            .split(',')
+            .map(|e| Self::parse_expression(e.trim()))
+            .collect();
+        return Ok(CExpression::ArrayLiteral(elements?));
     }
 
     // ===============================
-    // 5️⃣ Literal
+    // 3️⃣ Logical operators (lowest precedence)
     // ===============================
+    if let Some(pos) = find_operator_outside_parens(expr, "||") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Or, right: Box::new(right) });
+    }
+    if let Some(pos) = find_operator_outside_parens(expr, "&&") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::And, right: Box::new(right) });
+    }
 
+    // ===============================
+    // 4️⃣ Equality operators
+    // ===============================
+    if let Some(pos) = find_operator_outside_parens(expr, "==") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Equal, right: Box::new(right) });
+    }
+    if let Some(pos) = find_operator_outside_parens(expr, "!=") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::NotEqual, right: Box::new(right) });
+    }
+
+    // ===============================
+    // 5️⃣ Relational operators
+    // ===============================
+    if let Some(pos) = find_operator_outside_parens(expr, "<=") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::LessEq, right: Box::new(right) });
+    }
+    if let Some(pos) = find_operator_outside_parens(expr, ">=") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+2..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::GreaterEq, right: Box::new(right) });
+    }
+    if let Some(pos) = find_operator_outside_parens(expr, "<") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Less, right: Box::new(right) });
+    }
+    if let Some(pos) = find_operator_outside_parens(expr, ">") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Greater, right: Box::new(right) });
+    }
+
+    // ===============================
+    // 6️⃣ Assignment (single =)
+    // ===============================
+    if let Some(pos) = find_plain_assign_outside_parens(expr) {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Assign, right: Box::new(right) });
+    }
+
+    // ===============================
+    // 7️⃣ Arithmetic: +, -, *, /, %
+    // ===============================
+    if let Some(pos) = find_operator_outside_parens(expr, "+") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Add, right: Box::new(right) });
+    }
+    // Subtraction: skip leading minus (negative literal)
+    if let Some(pos) = find_binary_minus(expr) {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Sub, right: Box::new(right) });
+    }
+    if let Some(pos) = find_operator_outside_parens(expr, "*") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Mul, right: Box::new(right) });
+    }
+    if let Some(pos) = find_operator_outside_parens(expr, "/") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Div, right: Box::new(right) });
+    }
+    if let Some(pos) = find_operator_outside_parens(expr, "%") {
+        let left = Self::parse_expression(&expr[..pos])?;
+        let right = Self::parse_expression(&expr[pos+1..])?;
+        return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Mod, right: Box::new(right) });
+    }
+
+    // ===============================
+    // 8️⃣ Unary minus
+    // ===============================
+    if expr.starts_with('-') {
+        let operand = Self::parse_expression(&expr[1..])?;
+        return Ok(CExpression::UnaryOp { op: UnaryOp::Neg, operand: Box::new(operand) });
+    }
+    if expr.starts_with('!') {
+        let operand = Self::parse_expression(&expr[1..])?;
+        return Ok(CExpression::UnaryOp { op: UnaryOp::Not, operand: Box::new(operand) });
+    }
+
+    // ===============================
+    // 9️⃣ Array access: arr[i] or arr[i][j]
+    // ===============================
+    let arr_access_re = regex::Regex::new(r"^(\w+)\[([^\[\]]+)\]$").unwrap();
+    if let Some(cap) = arr_access_re.captures(expr) {
+        let array = CExpression::Variable(cap[1].to_string());
+        let index = Self::parse_expression(&cap[2])?;
+        return Ok(CExpression::ArrayAccess {
+            array: Box::new(array),
+            index: Box::new(index),
+        });
+    }
+
+    // ===============================
+    // 🔟 Function call: func(args)
+    // ===============================
+    let call_re = regex::Regex::new(r"^(\w+)\((.+)\)$").unwrap();
+    if let Some(cap) = call_re.captures(expr) {
+        let func_name = cap[1].to_string();
+        let args_str = &cap[2];
+        let args = if args_str.trim().is_empty() {
+            vec![]
+        } else {
+            split_args(args_str)?
+        };
+        return Ok(CExpression::Call { function: func_name, args });
+    }
+    // Function call with no args: func()
+    let call_empty_re = regex::Regex::new(r"^(\w+)\(\s*\)$").unwrap();
+    if let Some(cap) = call_empty_re.captures(expr) {
+        return Ok(CExpression::Call { function: cap[1].to_string(), args: vec![] });
+    }
+
+    // ===============================
+    // 1️⃣1️⃣ Literals
+    // ===============================
     if let Ok(num) = expr.parse::<i64>() {
         return Ok(CExpression::Literal(CLiteral::Int(num)));
     }
+    if let Ok(num) = expr.parse::<f64>() {
+        return Ok(CExpression::Literal(CLiteral::Float(num)));
+    }
+    if expr.starts_with('\'') && expr.ends_with('\'') && expr.len() >= 3 {
+        let ch = expr.chars().nth(1).unwrap_or('\0');
+        return Ok(CExpression::Literal(CLiteral::Char(ch)));
+    }
+    if expr.starts_with('"') && expr.ends_with('"') {
+        let s = expr[1..expr.len()-1].to_string();
+        return Ok(CExpression::Literal(CLiteral::String(s)));
+    }
 
     // ===============================
-    // 6️⃣ Variable fallback
+    // 1️⃣2️⃣ Variable fallback
     // ===============================
-
     Ok(CExpression::Variable(expr.to_string()))
 }
 
-     /// Parse a single simple statement (used by control flow parser)
+    /// Parse a single simple statement (used by control flow parser)
     pub fn parse_single_statement(stmt: &str) -> Result<CStatement> {
         let stmt = stmt.trim();
+
+        // Break / Continue
+        if stmt == "break" { return Ok(CStatement::Break); }
+        if stmt == "continue" { return Ok(CStatement::Continue); }
 
         // Return
         if stmt.starts_with("return") {
@@ -727,7 +815,50 @@ impl SimpleParser {
             }
         }
 
-        // Variable declaration with initialization
+        // Array declaration with initializer: int arr[] = {1,2,3}  OR  int arr[5] = {1,2,3}
+        let arr_decl_init = regex::Regex::new(r"^(int|char|float|double)\s+(\w+)\[(\d*)\]\s*=\s*(.+)$").unwrap();
+        if let Some(cap) = arr_decl_init.captures(stmt) {
+            let base_type = Self::parse_type(&cap[1]);
+            let name = cap[2].to_string();
+            let size_str = &cap[3];
+            let init_expr = Self::parse_expression(&cap[4])?;
+            let size = size_str.parse::<usize>().ok();
+            return Ok(CStatement::VarDecl {
+                name,
+                var_type: CType::Array(Box::new(base_type), size),
+                init: Some(init_expr),
+            });
+        }
+
+        // Array declaration without initializer: int arr[5]
+        let arr_decl = regex::Regex::new(r"^(int|char|float|double)\s+(\w+)\[(\d+)\]$").unwrap();
+        if let Some(cap) = arr_decl.captures(stmt) {
+            let base_type = Self::parse_type(&cap[1]);
+            let name = cap[2].to_string();
+            let size = cap[3].parse::<usize>().ok();
+            return Ok(CStatement::VarDecl {
+                name,
+                var_type: CType::Array(Box::new(base_type), size),
+                init: None,
+            });
+        }
+
+        // Pointer declaration: int *arr or int* arr  (e.g. for matrix rows)
+        let ptr_decl = regex::Regex::new(r"^(int|char|float|double)\s*\*\s*(\w+)(?:\s*=\s*(.+))?$").unwrap();
+        if let Some(cap) = ptr_decl.captures(stmt) {
+            let base_type = Self::parse_type(&cap[1]);
+            let name = cap[2].to_string();
+            let init = if let Some(init_str) = cap.get(3) {
+                Some(Self::parse_expression(init_str.as_str())?)
+            } else { None };
+            return Ok(CStatement::VarDecl {
+                name,
+                var_type: CType::Pointer(Box::new(base_type)),
+                init,
+            });
+        }
+
+        // Variable declaration with initialization: int x = expr
         let decl_pattern = regex::Regex::new(r"^(int|char|float|double)\s+(\w+)\s*=\s*(.+)$").unwrap();
         if let Some(cap) = decl_pattern.captures(stmt) {
             return Ok(CStatement::VarDecl {
@@ -737,7 +868,7 @@ impl SimpleParser {
             });
         }
 
-        // Variable declaration without initialization
+        // Variable declaration without initialization: int x
         let decl_simple = regex::Regex::new(r"^(int|char|float|double)\s+(\w+)$").unwrap();
         if let Some(cap) = decl_simple.captures(stmt) {
             return Ok(CStatement::VarDecl {
@@ -747,7 +878,77 @@ impl SimpleParser {
             });
         }
 
-        // Assignment
+        // Indexed assignment: arr[i] = expr  OR  arr[i][j] = expr
+        let idx_assign = regex::Regex::new(r"^(\w+)\[([^\]]+)\]\s*=\s*(.+)$").unwrap();
+        if let Some(cap) = idx_assign.captures(stmt) {
+            let array = cap[1].to_string();
+            let index = Self::parse_expression(&cap[2])?;
+            let value = Self::parse_expression(&cap[3])?;
+            return Ok(CStatement::IndexedAssignment { array, index, value });
+        }
+
+        // Compound assignments: x += y  x -= y  x *= y  x /= y  x %= y
+        let compound_re = regex::Regex::new(r"^(\w+)\s*(\+=|-=|\*=|/=|%=)\s*(.+)$").unwrap();
+        if let Some(cap) = compound_re.captures(stmt) {
+            let var = cap[1].to_string();
+            let op_str = &cap[2];
+            let rhs = Self::parse_expression(&cap[3])?;
+            let op = match op_str {
+                "+=" => BinOp::Add,
+                "-=" => BinOp::Sub,
+                "*=" => BinOp::Mul,
+                "/=" => BinOp::Div,
+                "%=" => BinOp::Mod,
+                _ => BinOp::Add,
+            };
+            // Desugar: x += y  →  Assignment { x, x + y }
+            let expanded = CExpression::BinaryOp {
+                left: Box::new(CExpression::Variable(var.clone())),
+                op,
+                right: Box::new(rhs),
+            };
+            return Ok(CStatement::Assignment { target: var, value: expanded });
+        }
+
+        // Increment/Decrement: i++, i--, ++i, --i
+        if stmt.ends_with("++") {
+            let var = stmt.trim_end_matches("++").trim().to_string();
+            let expanded = CExpression::BinaryOp {
+                left: Box::new(CExpression::Variable(var.clone())),
+                op: BinOp::Add,
+                right: Box::new(CExpression::Literal(CLiteral::Int(1))),
+            };
+            return Ok(CStatement::Assignment { target: var, value: expanded });
+        }
+        if stmt.ends_with("--") {
+            let var = stmt.trim_end_matches("--").trim().to_string();
+            let expanded = CExpression::BinaryOp {
+                left: Box::new(CExpression::Variable(var.clone())),
+                op: BinOp::Sub,
+                right: Box::new(CExpression::Literal(CLiteral::Int(1))),
+            };
+            return Ok(CStatement::Assignment { target: var, value: expanded });
+        }
+        if stmt.starts_with("++") {
+            let var = stmt.trim_start_matches("++").trim().to_string();
+            let expanded = CExpression::BinaryOp {
+                left: Box::new(CExpression::Variable(var.clone())),
+                op: BinOp::Add,
+                right: Box::new(CExpression::Literal(CLiteral::Int(1))),
+            };
+            return Ok(CStatement::Assignment { target: var, value: expanded });
+        }
+        if stmt.starts_with("--") {
+            let var = stmt.trim_start_matches("--").trim().to_string();
+            let expanded = CExpression::BinaryOp {
+                left: Box::new(CExpression::Variable(var.clone())),
+                op: BinOp::Sub,
+                right: Box::new(CExpression::Literal(CLiteral::Int(1))),
+            };
+            return Ok(CStatement::Assignment { target: var, value: expanded });
+        }
+
+        // Plain Assignment: x = expr
         let assign_pattern = regex::Regex::new(r"^(\w+)\s*=\s*(.+)$").unwrap();
         if let Some(cap) = assign_pattern.captures(stmt) {
             return Ok(CStatement::Assignment {
@@ -796,4 +997,105 @@ fn extract_balanced_braces(code: &str, start_pos: usize) -> Result<(String, usiz
 pub fn read_c_file(path: &Path) -> Result<String> {
     std::fs::read_to_string(path)
         .context(format!("Failed to read C file: {}", path.display()))
+}
+// ============================================================
+// Helper: find an operator at the top level (outside parens/brackets)
+// ============================================================
+fn find_operator_outside_parens(expr: &str, op: &str) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let mut depth_paren = 0i32;
+    let mut depth_bracket = 0i32;
+    let mut i = 0usize;
+
+    while i <= expr.len().saturating_sub(op.len()) {
+        match bytes[i] {
+            b'(' => { depth_paren += 1; i += 1; continue; }
+            b')' => { depth_paren -= 1; i += 1; continue; }
+            b'[' => { depth_bracket += 1; i += 1; continue; }
+            b']' => { depth_bracket -= 1; i += 1; continue; }
+            _ => {}
+        }
+        if depth_paren == 0 && depth_bracket == 0 {
+            if expr[i..].starts_with(op) {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_plain_assign_outside_parens(expr: &str) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let mut depth_paren = 0i32;
+    let mut depth_bracket = 0i32;
+    let mut i = 0usize;
+
+    while i < expr.len() {
+        match bytes[i] {
+            b'(' => { depth_paren += 1; i += 1; continue; }
+            b')' => { depth_paren -= 1; i += 1; continue; }
+            b'[' => { depth_bracket += 1; i += 1; continue; }
+            b']' => { depth_bracket -= 1; i += 1; continue; }
+            _ => {}
+        }
+        if depth_paren == 0 && depth_bracket == 0 && bytes[i] == b'=' {
+            let prev = if i > 0 { bytes[i-1] } else { 0 };
+            let next = if i+1 < bytes.len() { bytes[i+1] } else { 0 };
+            if prev != b'!' && prev != b'<' && prev != b'>' && prev != b'=' && next != b'=' {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_binary_minus(expr: &str) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let mut depth_paren = 0i32;
+    let mut depth_bracket = 0i32;
+    let mut i = expr.len();
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b'(' => { depth_paren -= 1; continue; }
+            b')' => { depth_paren += 1; continue; }
+            b'[' => { depth_bracket -= 1; continue; }
+            b']' => { depth_bracket += 1; continue; }
+            _ => {}
+        }
+        if depth_paren == 0 && depth_bracket == 0 && bytes[i] == b'-' && i > 0 {
+            let prev = bytes[i-1];
+            if prev.is_ascii_alphanumeric() || prev == b')' || prev == b']' || prev == b'_' {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn split_args(args_str: &str) -> Result<Vec<CExpression>> {
+    let mut args = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, ch) in args_str.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                let arg = args_str[start..i].trim();
+                if !arg.is_empty() {
+                    args.push(SimpleParser::parse_expression(arg)?);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = args_str[start..].trim();
+    if !last.is_empty() {
+        args.push(SimpleParser::parse_expression(last)?);
+    }
+    Ok(args)
 }

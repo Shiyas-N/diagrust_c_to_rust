@@ -179,6 +179,35 @@ impl CompilerLoop {
                 }
             }
             
+            // Repair Rule 5: Array indexed by i32 instead of usize (E0277)
+            if let Some("E0277") = error_code {
+                if error.message.contains("cannot be indexed by `i32`")
+                    || error.message.contains("cannot be indexed by") {
+                    println!("   🔧 Repair: Adding `as usize` casts on array indices");
+
+                    // Replace patterns like arr[expr] where expr is not already usize
+                    // We replace `arr[<anything not containing as usize>]`
+                    let idx_pattern = regex::Regex::new(
+                        r"\[([^\[\]]+)\]"
+                    ).unwrap();
+
+                    let new_code = idx_pattern.replace_all(&repaired_code, |caps: &regex::Captures| {
+                        let inner = &caps[1];
+                        // Skip if already has usize cast or is a plain literal
+                        if inner.contains("as usize") || inner.parse::<usize>().is_ok() {
+                            format!("[{}]", inner)
+                        } else {
+                            format!("[({}) as usize]", inner)
+                        }
+                    }).to_string();
+
+                    if new_code != repaired_code {
+                        repaired_code = new_code;
+                        repairs_applied = true;
+                    }
+                }
+            }
+
             // Repair Rule 4: Missing return statement
             if error.message.contains("mismatched types") && error.message.contains("expected `()`") {
                 if !repaired_code.contains("return;") {

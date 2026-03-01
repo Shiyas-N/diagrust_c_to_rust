@@ -103,6 +103,13 @@ impl RustTranslator {
                     format!("&mut {}", self.translate_type(inner))
                 }
             }
+            CType::Array(inner, Some(size)) => {
+                format!("[{}; {}]", self.translate_type(inner), size)
+            }
+            CType::Array(inner, None) => {
+                // Unsized array → slice reference
+                format!("Vec<{}>", self.translate_type(inner))
+            }
             CType::Unknown(name) => name.clone(),
         }
     }
@@ -116,6 +123,20 @@ impl RustTranslator {
         let indent_str = "    ".repeat(indent);
 
         match stmt {
+            CStatement::IndexedAssignment { array, index, value } => {
+                let idx = self.translate_index(index)?;
+                let val = self.translate_expression(value)?;
+                Ok(format!("{}{}[{}] = {};\n", indent_str, array, idx, val))
+            }
+
+            CStatement::Break => {
+                Ok(format!("{}break;\n", indent_str))
+            }
+
+            CStatement::Continue => {
+                Ok(format!("{}continue;\n", indent_str))
+            }
+
             CStatement::Return(Some(expr)) => {
                 let rust_expr = self.translate_expression(expr)?;
                 Ok(format!("{}return {};\n", indent_str, rust_expr))
@@ -134,9 +155,32 @@ impl RustTranslator {
                     ""
                 };
 
+                // Uninitialized fixed-size array → zero-initialize
+                if let CType::Array(inner, Some(size)) = var_type {
+                    if init.is_none() {
+                        let default_val = match inner.as_ref() {
+                            CType::Float | CType::Double => "0.0",
+                            _ => "0",
+                        };
+                        return Ok(format!(
+                            "{}let {}{}: {} = [{}; {}];\n",
+                            indent_str, mut_keyword, name, rust_type, default_val, size
+                        ));
+                    }
+                }
+                // Unsized array without init → Vec::new()
+                if let CType::Array(inner, None) = var_type {
+                    if init.is_none() {
+                        let elem_type = self.translate_type(inner);
+                        return Ok(format!(
+                            "{}let {}{}: Vec<{}> = Vec::new();\n",
+                            indent_str, mut_keyword, name, elem_type
+                        ));
+                    }
+                }
+
                 if let Some(init_expr) = init {
-                    let rust_expr =
-                        self.translate_expression(init_expr)?;
+                    let rust_expr = self.translate_expression(init_expr)?;
                     Ok(format!(
                         "{}let {}{}: {} = {};\n",
                         indent_str, mut_keyword, name, rust_type, rust_expr
@@ -263,6 +307,26 @@ impl RustTranslator {
 
     fn translate_expression(&self, expr: &CExpression) -> Result<String> {
         match expr {
+            CExpression::ArrayAccess { array, index } => {
+                let arr = self.translate_expression(array)?;
+                let idx = self.translate_index(index)?;
+                Ok(format!("{}[{}]", arr, idx))
+            }
+
+            CExpression::ArrayLiteral(elements) => {
+                let elem_strs: Result<Vec<String>> = elements
+                    .iter()
+                    .map(|e| self.translate_expression(e))
+                    .collect();
+                Ok(format!("[{}]", elem_strs?.join(", ")))
+            }
+
+            CExpression::Cast { to_type, expr } => {
+                let inner = self.translate_expression(expr)?;
+                let rust_type = self.translate_type(to_type);
+                Ok(format!("({} as {})", inner, rust_type))
+            }
+
             CExpression::Literal(lit) => Ok(self.translate_literal(lit)),
 
             CExpression::Variable(name) => Ok(name.clone()),
@@ -303,6 +367,23 @@ impl RustTranslator {
 
             CExpression::Null => {
                 Ok("std::ptr::null_mut()".to_string())
+            }
+        }
+    }
+
+    /// Translate an array index expression, ensuring it is `usize`.
+    /// - Pure integer literals stay as-is (they're inferred as usize in array context)
+    /// - Everything else gets `as usize` appended
+    fn translate_index(&self, expr: &CExpression) -> Result<String> {
+        match expr {
+            // Plain integer literal: Rust infers usize, no cast needed
+            CExpression::Literal(CLiteral::Int(_)) => {
+                self.translate_expression(expr)
+            }
+            // Arithmetic on literals only (e.g. i*3+j — but i is i32 so still cast)
+            _ => {
+                let inner = self.translate_expression(expr)?;
+                Ok(format!("({}) as usize", inner))
             }
         }
     }
@@ -368,6 +449,11 @@ impl RustTranslator {
 
         CStatement::Assignment { target, .. } => {
             set.insert(target.clone());
+        }
+
+        CStatement::IndexedAssignment { array, .. } => {
+            // The array itself must be mutable
+            set.insert(array.clone());
         }
 
         CStatement::If { then_body, else_body, .. } => {

@@ -102,6 +102,20 @@ impl SymbolTableBuilder {
                     Self::collect_from_stmts(std::slice::from_ref(init), depth + 1, table);
                     Self::collect_from_stmts(body, depth + 1, table);
                 }
+                CStatement::StructDecl { name, struct_type, .. } => {
+                    table.symbols.insert(
+                        name.clone(),
+                        Symbol {
+                            name: name.clone(),
+                            c_type: ast_input::CType::Struct(struct_type.clone()),
+                            scope_depth: depth,
+                            is_parameter: false,
+                            is_pointer: false,
+                            is_array: false,
+                            declaration_line: 0,
+                        },
+                    );
+                }
                 _ => {}
             }
         }

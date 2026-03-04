@@ -180,7 +180,7 @@ fn translate_file(
     let c_program = SimpleParser::parse(&c_source)
         .context("C parsing failed")?;
 
-    println!("     ✓ Parsed {} function(s)", c_program.functions.len());
+    println!("     ✓ Parsed {} function(s), {} struct(s)", c_program.functions.len(), c_program.structs.len());
     if args.verbose {
         for f in &c_program.functions {
             println!("       · {}({} params)", f.name, f.parameters.len());

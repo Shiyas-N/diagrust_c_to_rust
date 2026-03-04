@@ -38,6 +38,16 @@ impl CodeAssembler {
             out.push('\n');
         }
 
+        // Struct definitions
+        for s in &program.structs {
+            out.push_str("#[derive(Debug, Clone, Copy, Default)]\n");
+            out.push_str(&format!("pub struct {} {{\n", s.name));
+            for field in &s.fields {
+                out.push_str(&format!("    pub {}: {},\n", field.name, field.rust_type));
+            }
+            out.push_str("}\n\n");
+        }
+
         // Functions
         for func in &program.functions {
             out.push_str(&FunctionTranslator::emit(func)?);
@@ -228,6 +238,18 @@ impl ExprEmitter {
             IrExpr::BoxNew(inner)     => format!("Box::new({})", Self::emit(inner)?),
             IrExpr::RcNew(inner)      => format!("Rc::new({})", Self::emit(inner)?),
             IrExpr::RefCellNew(inner) => format!("RefCell::new({})", Self::emit(inner)?),
+            IrExpr::FieldAccess { object, field } => {
+                format!("{}.{}", Self::emit(object)?, field)
+            }
+            IrExpr::StructLiteral { struct_type, fields } => {
+                let mut s = format!("{} {{ ", struct_type);
+                for (i, (fname, fexpr)) in fields.iter().enumerate() {
+                    if i > 0 { s.push_str(", "); }
+                    s.push_str(&format!("{}: {}", fname, Self::emit(fexpr)?));
+                }
+                s.push_str(" }");
+                s
+            }
         })
     }
 
@@ -247,6 +269,11 @@ impl ExprEmitter {
             BinOp::And    => "&&",
             BinOp::Or     => "||",
             BinOp::Assign => "=",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr  => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl    => "<<",
+            BinOp::Shr    => ">>",
         }
     }
 
@@ -256,6 +283,7 @@ impl ExprEmitter {
             UnaryOp::Not   => "!",
             UnaryOp::Deref => "*",
             UnaryOp::AddrOf => "&",
+            UnaryOp::BitNot => "!",  // Rust uses ! for bitwise not on integers
         }
     }
 }

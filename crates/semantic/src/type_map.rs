@@ -109,6 +109,17 @@ impl TypeMapper {
                     is_idiomatic: true,
                 }
             }
+            CType::Long  => RustType { rust_repr: "i64".to_string(),  requires_unsafe: false, is_idiomatic: true },
+            CType::UInt  => RustType { rust_repr: "u32".to_string(),  requires_unsafe: false, is_idiomatic: true },
+            CType::UChar => RustType { rust_repr: "u8".to_string(),   requires_unsafe: false, is_idiomatic: true },
+            CType::ULong => RustType { rust_repr: "u64".to_string(),  requires_unsafe: false, is_idiomatic: true },
+            CType::Short => RustType { rust_repr: "i16".to_string(),  requires_unsafe: false, is_idiomatic: true },
+            CType::Bool  => RustType { rust_repr: "bool".to_string(), requires_unsafe: false, is_idiomatic: true },
+            CType::Struct(name) => RustType {
+                rust_repr: name.clone(),
+                requires_unsafe: false,
+                is_idiomatic: true,
+            },
             CType::Unknown(name) => RustType {
                 rust_repr: name.clone(),
                 requires_unsafe: false,
@@ -166,6 +177,13 @@ impl TypeMapper {
                 let inner_str = Self::c_primitive_str(inner).unwrap_or_else(|| "u8".to_string());
                 Some(format!("&mut {}", inner_str))
             }
+            CType::Long   => Some("i64".to_string()),
+            CType::UInt   => Some("u32".to_string()),
+            CType::UChar  => Some("u8".to_string()),
+            CType::ULong  => Some("u64".to_string()),
+            CType::Short  => Some("i16".to_string()),
+            CType::Bool   => Some("bool".to_string()),
+            CType::Struct(n) => Some(n.clone()),
             _ => None,
         }
     }

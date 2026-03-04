@@ -9,3 +9,8 @@ thiserror.workspace = true
 serde      = { workspace = true }
 serde_json.workspace = true
 regex      = { workspace = true }
+# clang-sys with runtime loading: libclang is found at runtime via LIBCLANG_PATH
+# or the system PATH. No version-specific feature needed; clang-sys auto-detects
+# the installed LLVM version (9 through 18 all work).
+clang-sys  = { version = "1.8", features = ["runtime"] }
+libc       = "0.2"

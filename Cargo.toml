@@ -20,11 +20,11 @@ description = "DIAGRUST: Compiler-in-the-Loop Diagnostic-Driven Rust Transpilati
 
 
 [workspace.dependencies]
-anyhow = "1.0"
-thiserror = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-regex     = "1.10"
-log       = "0.4"
-env_logger = "0.10"
-clap      = { version = "4.4", features = ["derive"] }
+anyhow       = "1.0"
+thiserror    = "1.0"
+serde        = { version = "1.0", features = ["derive"] }
+serde_json   = "1.0"
+regex        = "1.10"
+clap         = { version = "4.0", features = ["derive"] }
+log          = "0.4"
+env_logger   = "0.11"

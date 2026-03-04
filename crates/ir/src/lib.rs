@@ -18,9 +18,25 @@ use std::collections::HashMap;
 // IR types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A struct field in the IR (mirrors CStructField).
+#[derive(Debug, Clone)]
+pub struct IrStructField {
+    pub name: String,
+    pub rust_type: String,
+}
+
+/// A struct definition in the IR.
+#[derive(Debug, Clone)]
+pub struct IrStructDef {
+    pub name: String,
+    pub fields: Vec<IrStructField>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IrProgram {
     pub functions: Vec<IrFunction>,
+    /// Struct definitions to emit as Rust structs.
+    pub structs: Vec<IrStructDef>,
     /// Set of `use` declarations needed at the top of the output file.
     pub required_uses: Vec<String>,
 }
@@ -121,6 +137,10 @@ pub enum IrExpr {
     OptionNone,
     /// `Some(expr)`
     OptionSome(Box<IrExpr>),
+    /// `obj.field`
+    FieldAccess { object: Box<IrExpr>, field: String },
+    /// Struct initialiser `TypeName { field: val, .. }`
+    StructLiteral { struct_type: String, fields: Vec<(String, IrExpr)> },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,8 +162,20 @@ impl IrBuilder {
             functions.push(ir_func);
         }
 
+        // Convert CStructDefs to IrStructDefs
+        let structs: Vec<IrStructDef> = program.structs.iter().map(|sd| {
+            IrStructDef {
+                name: sd.name.clone(),
+                fields: sd.fields.iter().map(|f| IrStructField {
+                    name: f.name.clone(),
+                    rust_type: Self::fallback_type(&f.field_type),
+                }).collect(),
+            }
+        }).collect();
+
         Ok(IrProgram {
             functions,
+            structs,
             required_uses: required_uses.into_iter().collect(),
         })
     }
@@ -267,6 +299,37 @@ impl IrBuilder {
                 let body_ir = Self::build_stmts(body, sem)?;
                 IrStatement::While2 { init: init_ir, condition: cond, increment: incr, body: body_ir }
             }
+            // ── New statements added for struct / field support ───────────────
+            CS::FieldAssignment { object, field, value } => {
+                let val_ir = Self::build_expr(value, sem)?;
+                IrStatement::Assign {
+                    target: format!("{}.{}", object, field),
+                    value: val_ir,
+                }
+            }
+            CS::StructDecl { name, struct_type, fields } => {
+                // Emit as a let binding; initialiser is a struct-literal expr
+                let init_fields: Vec<(String, IrExpr)> = fields
+                    .iter()
+                    .map(|(fname, fexpr)| {
+                        Self::build_expr(fexpr, sem).map(|e| (fname.clone(), e))
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                let init = if init_fields.is_empty() {
+                    None
+                } else {
+                    Some(IrExpr::StructLiteral {
+                        struct_type: struct_type.clone(),
+                        fields: init_fields,
+                    })
+                };
+                IrStatement::LetBinding {
+                    name: name.clone(),
+                    rust_type: struct_type.clone(),
+                    init,
+                    is_mutable: true,
+                }
+            }
         })
     }
 
@@ -307,6 +370,19 @@ impl IrBuilder {
                 let rust_type = Self::fallback_type(to_type);
                 IrExpr::Cast { to_type: rust_type, expr: Box::new(Self::build_expr(inner, sem)?) }
             }
+            CE::FieldAccess { object, field } => {
+                IrExpr::FieldAccess {
+                    object: Box::new(Self::build_expr(object, sem)?),
+                    field: field.clone(),
+                }
+            }
+            CE::StructLiteral { struct_type, fields } => {
+                let ir_fields: Vec<(String, IrExpr)> = fields
+                    .iter()
+                    .map(|(name, expr)| Self::build_expr(expr, sem).map(|e| (name.clone(), e)))
+                    .collect::<anyhow::Result<_>>()?;
+                IrExpr::StructLiteral { struct_type: struct_type.clone(), fields: ir_fields }
+            }
         })
     }
 
@@ -325,15 +401,22 @@ impl IrBuilder {
 
     fn fallback_type(ctype: &CType) -> String {
         match ctype {
-            CType::Void => "()".to_string(),
-            CType::Int => "i32".to_string(),
-            CType::Char => "u8".to_string(),
-            CType::Float => "f32".to_string(),
+            CType::Void   => "()".to_string(),
+            CType::Int    => "i32".to_string(),
+            CType::Char   => "u8".to_string(),
+            CType::UChar  => "u8".to_string(),
+            CType::Short  => "i16".to_string(),
+            CType::Long   => "i64".to_string(),
+            CType::UInt   => "u32".to_string(),
+            CType::ULong  => "u64".to_string(),
+            CType::Bool   => "bool".to_string(),
+            CType::Float  => "f32".to_string(),
             CType::Double => "f64".to_string(),
             CType::Pointer(inner) => format!("*mut {}", Self::fallback_type(inner)),
             CType::Array(inner, Some(n)) => format!("[{}; {}]", Self::fallback_type(inner), n),
-            CType::Array(inner, None) => format!("Vec<{}>", Self::fallback_type(inner)),
-            CType::Unknown(s) => s.clone(),
+            CType::Array(inner, None)    => format!("Vec<{}>",  Self::fallback_type(inner)),
+            CType::Struct(name)          => name.clone(),
+            CType::Unknown(s)            => s.clone(),
         }
     }
 }

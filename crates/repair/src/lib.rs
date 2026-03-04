@@ -11,7 +11,7 @@
 //!  - Unused variable warnings
 
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Diagnostic types (parsed from rustc JSON output)

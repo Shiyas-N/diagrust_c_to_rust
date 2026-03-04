@@ -812,11 +812,12 @@ impl SimpleParser {
         let right = Self::parse_expression(&expr[pos+1..])?;
         return Ok(CExpression::BinaryOp { left: Box::new(left), op: BinOp::Sub, right: Box::new(right) });
     }
-    // Binary multiply: scan for * with non-empty left side (skip unary deref at pos 0)
+    // Binary multiply: scan for * with a valid (non-operator-only) left side
+    // Skips cases like **pp where the left of the second * is just "*" (unary deref)
     {
         let bytes = expr.as_bytes();
-        let mut dp = 0i32; // depth paren
-        let mut db = 0i32; // depth bracket
+        let mut dp = 0i32;
+        let mut db = 0i32;
         let mut found_mul: Option<usize> = None;
         let mut i = 0usize;
         while i < expr.len() {
@@ -827,9 +828,17 @@ impl SimpleParser {
                 b']' => { db -= 1; i += 1; continue; }
                 _ => {}
             }
-            if dp == 0 && db == 0 && bytes[i] == b'*' && i > 0 && !expr[..i].trim().is_empty() {
-                found_mul = Some(i);
-                break;
+            if dp == 0 && db == 0 && bytes[i] == b'*' && i > 0 {
+                // The left side must contain at least one alphanumeric, ')' or ']'
+                // character — a pure run of '*' means it's a chain of unary derefs
+                let left_part = expr[..i].trim();
+                let left_has_value = left_part.bytes().any(|b| {
+                    b.is_ascii_alphanumeric() || b == b'_' || b == b')' || b == b']'
+                });
+                if left_has_value {
+                    found_mul = Some(i);
+                    break;
+                }
             }
             i += 1;
         }

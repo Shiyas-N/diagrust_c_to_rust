@@ -98,6 +98,17 @@ impl RepairEngine {
         let mut current = code.to_string();
         let mut actions = Vec::new();
 
+        // ── Pass 0: Proactive structural fixes (no diagnostics needed) ────────
+        // Fix for-loop variables that are assigned inside the while body but declared immutable.
+        // Pattern: `let i: T = ...;` followed later by `i = ...;` → upgrade to `let mut i: T`.
+        let (r, c) = Self::repair_loop_var_mutability(&current);
+        if c { current = r; actions.push(action("LoopVarMut", "Made for-loop variable mutable")); }
+
+        // Normalise `x = x OP expr` → `x OP= expr` before anything else so
+        // subsequent passes work on simpler code.
+        let (r, c) = Self::repair_compound_assignments(&current);
+        if c { current = r; actions.push(action("CompoundAssign", "Replaced x = x OP expr with x OP= expr")); }
+
         // ── Pass 1: Structural / format fixes (run once upfront) ──────────────
 
         let (r, c) = Self::repair_print_flush_semicolon(&current);
@@ -281,7 +292,6 @@ impl RepairEngine {
     // ─────────────────────────────────────────────────────────────────────────
 
     fn repair_format_specifiers(code: &str) -> (String, bool) {
-        
         let re = Regex::new(r##"((?:println|print|eprintln|eprint)!\(")((?:[^"\\]|\\.)*)(")"##).unwrap();
         let mut changed = false;
         let result = re.replace_all(code, |caps: &regex::Captures| {
@@ -582,10 +592,17 @@ impl RepairEngine {
 
     fn repair_add_mut(code: &str, diag: &RustcDiagnostic) -> (String, bool) {
         if let Some(var_name) = Self::extract_variable_from_borrow(&diag.message) {
-            let old_pattern = format!("let {}: ", var_name);
-            let new_pattern = format!("let mut {}: ", var_name);
-            if code.contains(&old_pattern) {
-                return (code.replace(&old_pattern, &new_pattern), true);
+            // Try `let varname: ` form first
+            let old_typed = format!("let {}: ", var_name);
+            let new_typed = format!("let mut {}: ", var_name);
+            if code.contains(&old_typed) {
+                return (code.replacen(&old_typed, &new_typed, 1), true);
+            }
+            // Try `let varname =` form (no type annotation)
+            let old_plain = format!("let {} =", var_name);
+            let new_plain = format!("let mut {} =", var_name);
+            if code.contains(&old_plain) {
+                return (code.replacen(&old_plain, &new_plain, 1), true);
             }
         }
         (code.to_string(), false)
@@ -740,6 +757,60 @@ impl RepairEngine {
     fn extract_undefined_name(message: &str) -> Option<String> {
         Regex::new(r"cannot find value `(\w+)` in this scope").unwrap()
             .captures(message)?.get(1).map(|m| m.as_str().to_string())
+    }
+
+    // ── Pass 0 helpers ────────────────────────────────────────────────────────
+
+    /// Scan for `let <name>:` bindings that are later assigned (`<name> =`) and
+    /// upgrade them to `let mut <name>:`.  This catches for-loop variables like
+    /// `let i: i32 = 0;` that are mutated by the while-loop increment.
+    fn repair_loop_var_mutability(code: &str) -> (String, bool) {
+        let decl_re = Regex::new(r"(?m)^\s*let (\w+):").unwrap();
+        let mut changed = false;
+        let mut result = code.to_string();
+
+        // Collect all immutable bindings
+        let candidates: Vec<String> = decl_re.captures_iter(code)
+            .filter(|cap| {
+                // Only upgrade if not already `let mut`
+                let full = cap.get(0).unwrap().as_str();
+                !full.contains("let mut ")
+            })
+            .map(|cap| cap[1].to_string())
+            .collect();
+
+        for var in candidates {
+            // Check if this variable is ever assigned after its declaration
+            let assign_re = Regex::new(&format!(r"(?m)^\s+{} =", regex::escape(&var))).unwrap();
+            if assign_re.is_match(code) {
+                let old = format!("let {}: ", var);
+                let new = format!("let mut {}: ", var);
+                if result.contains(&old) {
+                    result = result.replacen(&old, &new, 1);
+                    changed = true;
+                }
+            }
+        }
+        (result, changed)
+    }
+
+    /// Rewrite `x = x OP expr;` to `x OP= expr;` for +, -, *, /, %.
+    fn repair_compound_assignments(code: &str) -> (String, bool) {
+        let mut result = code.to_string();
+        let mut changed = false;
+        for (op, compound) in &[("+", "+="), ("-", "-="), ("*", "*="), ("/", "/="), ("%", "%=")] {
+            let pat = format!(
+                r"(?m)^(\s*)(\w+) = \2 \{} ([^;\n]+);",
+                op
+            );
+            if let Ok(re) = Regex::new(&pat) {
+                let new = re.replace_all(&result, |caps: &regex::Captures| {
+                    format!("{}{} {} {};", &caps[1], &caps[2], compound, &caps[3])
+                }).to_string();
+                if new != result { result = new; changed = true; }
+            }
+        }
+        (result, changed)
     }
 }
 

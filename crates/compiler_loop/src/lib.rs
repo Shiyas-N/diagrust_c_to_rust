@@ -8,6 +8,26 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Windows: suppress the flash of a console window for every rustc/gcc call.
+// On non-Windows this is a no-op.
+// ─────────────────────────────────────────────────────────────────────────────
+trait NoWindow {
+    fn no_window(&mut self) -> &mut Self;
+}
+
+impl NoWindow for Command {
+    fn no_window(&mut self) -> &mut Self {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            self.creation_flags(CREATE_NO_WINDOW);
+        }
+        self
+    }
+}
+
 #[derive(Debug)]
 pub struct CompilationResult {
     pub success: bool,
@@ -91,13 +111,27 @@ impl CompilerLoop {
 
             if result.success {
                 println!("  ✅ Compilation succeeded on iteration {}!", iteration);
+                // Apply idiomatic Rust transformations (x = x + 1 → x += 1, etc.)
+                let idiomatic_code = Self::apply_idiom_pass(&current_code);
+                // Re-verify the idiomatized code compiles cleanly
+                let final_code = if idiomatic_code != current_code {
+                    let check = self.compile(&idiomatic_code)?;
+                    if check.success {
+                        println!("  ✨ Idiom pass applied successfully.");
+                        idiomatic_code
+                    } else {
+                        current_code.clone()
+                    }
+                } else {
+                    current_code.clone()
+                };
                 let outcome = LoopOutcome::Success {
-                    final_code: current_code.clone(),
+                    final_code: final_code.clone(),
                     iterations: iteration,
                     repair_log: repair_log.clone(),
                 };
                 let report = ReportBuilder::build(
-                    input_file, output_file, original_c, &current_code,
+                    input_file, output_file, original_c, &final_code,
                     iteration, self.max_iterations, true,
                     0, result.warnings.len(),
                     repair_log, semantic_summary, validation_warnings,
@@ -228,20 +262,31 @@ impl CompilerLoop {
         let rust_file = self.temp_dir.join("diagrust_temp.rs");
         std::fs::write(&rust_file, code).context("Failed to write temp Rust file")?;
 
-        let output = Command::new("rustc")
-            .arg("--crate-type=bin")
-            .arg("--error-format=json")
-            .arg("--edition=2021")
-            .arg(&rust_file)
-            .arg("-o").arg(self.temp_dir.join("diagrust_temp"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .context("Failed to invoke rustc")?;
+        // Auto-detect whether the code is a binary (has fn main) or a library.
+        // Library code is compiled with --crate-type=lib so rustc doesn't
+        // complain about a missing `main` function.
+        let (crate_type, extra_args): (&str, &[&str]) = if code.contains("fn main()") {
+            ("bin", &[])
+        } else {
+            ("lib", &[])
+        };
 
+        let mut cmd = Command::new("rustc");
+        cmd.no_window()
+           .arg(format!("--crate-type={}", crate_type))
+           .arg("--error-format=json")
+           .arg("--edition=2021")
+           .arg(&rust_file)
+           .stdout(Stdio::piped())
+           .stderr(Stdio::piped());
+        if crate_type == "bin" {
+            cmd.arg("-o").arg(self.temp_dir.join("diagrust_temp"));
+        }
+        for arg in extra_args { cmd.arg(arg); }
+
+        let output = cmd.output().context("Failed to invoke rustc")?;
         let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let (errors, warnings) = DiagnosticParser::parse(&raw_stderr);
-
         Ok(CompilationResult { success: output.status.success(), errors, warnings, raw_stderr })
     }
 
@@ -252,7 +297,7 @@ impl CompilerLoop {
             return Err(anyhow::anyhow!("Binary not found — compile first"));
         }
         let mut cmd = Command::new(&binary);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.no_window().stdout(Stdio::piped()).stderr(Stdio::piped());
         if stdin_input.is_some() { cmd.stdin(Stdio::piped()); }
 
         let mut child = cmd.spawn().context("Failed to run binary")?;
@@ -273,7 +318,7 @@ impl CompilerLoop {
     }
 
     pub fn rustc_available(&self) -> bool {
-        Command::new("rustc").arg("--version")
+        Command::new("rustc").no_window().arg("--version")
             .stdout(Stdio::null()).stderr(Stdio::null())
             .status().map(|s| s.success()).unwrap_or(false)
     }
@@ -282,16 +327,59 @@ impl CompilerLoop {
         let _ = std::fs::remove_dir_all(&self.temp_dir);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Idiom pass: convert verbose C-style patterns to idiomatic Rust
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub fn apply_idiom_pass(code: &str) -> String {
+        let mut out = code.to_string();
+
+        // x = x OP expr  →  x OP= expr  (backup — repair pass runs this too)
+        for (op, compound) in &[("+", "+="), ("-", "-="), ("*", "*="), ("/", "/="), ("%", "%=")] {
+            let pat = format!(r"(?m)^(\s*)(\w+) = \2 \{op} ([^;\n]+);");
+            if let Ok(re) = regex::Regex::new(&pat) {
+                let new = re.replace_all(&out, |caps: &regex::Captures| {
+                    format!("{}{} {} {};", &caps[1], &caps[2], compound, &caps[3])
+                }).to_string();
+                if new != out { out = new; }
+            }
+        }
+
+        // `i += 1` is already idiomatic — no further change needed for increments.
+
+        // `return expr;` as the ONLY statement before a fn-level `}` → trailing expression.
+        // Matches:  <4 spaces>return expr;\n}   (top-level close at column 0)
+        let return_re = regex::Regex::new(r"(?m)^(    )return ([^;{}\n]+);\n\}").unwrap();
+        out = return_re.replace_all(&out, |caps: &regex::Captures| {
+            format!("    {}\n}}", &caps[2])
+        }).to_string();
+
+        // Remove dead `else {}` blocks
+        let empty_else = regex::Regex::new(r" else \{\s*\}").unwrap();
+        out = empty_else.replace_all(&out, "").to_string();
+
+        // Double semicolons from repair
+        out = out.replace(";;", ";");
+
+        out
+    }
+
     pub fn compile_rust_code(&self, code: &str, temp_dir: &Path) -> Result<CompilationResult> {
         let rust_file = temp_dir.join("diagrust_temp.rs");
         std::fs::write(&rust_file, code)?;
-        let output = Command::new("rustc")
-            .arg("--crate-type=lib")
-            .arg("--error-format=json")
-            .arg("--edition=2021")
-            .arg(&rust_file)
-            .stdout(Stdio::piped()).stderr(Stdio::piped())
-            .output().context("Failed to invoke rustc")?;
+        // Auto-detect bin vs lib
+        let crate_type = if code.contains("fn main()") { "bin" } else { "lib" };
+        let mut cmd = Command::new("rustc");
+        cmd.no_window()
+           .arg(format!("--crate-type={}", crate_type))
+           .arg("--error-format=json")
+           .arg("--edition=2021")
+           .arg(&rust_file)
+           .stdout(Stdio::piped()).stderr(Stdio::piped());
+        if crate_type == "bin" {
+            cmd.arg("-o").arg(temp_dir.join("diagrust_temp"));
+        }
+        let output = cmd.output().context("Failed to invoke rustc")?;
         let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let (errors, warnings) = DiagnosticParser::parse(&raw_stderr);
         Ok(CompilationResult { success: output.status.success(), errors, warnings, raw_stderr })

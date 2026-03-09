@@ -171,9 +171,29 @@ impl MutabilityAnalyser {
                 if let Some(eb) = else_body { for s in eb { Self::from_statement(s, set); } }
             }
             CStatement::While { body, .. } => { for s in body { Self::from_statement(s, set); } }
-            CStatement::For { init, body, .. } => {
+            CStatement::For { init, increment, body, .. } => {
                 Self::from_statement(init, set);
+                // The increment expression (e.g. `i = i + 1`) mutates the loop variable.
+                // Extract any assignment target from it so the binding is marked `mut`.
+                Self::from_expr_assignments(increment, set);
                 for s in body { Self::from_statement(s, set); }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk an expression and collect any variable names on the left-hand side
+    /// of an assignment operator — used to detect for-loop increment mutations.
+    fn from_expr_assignments(expr: &CExpression, set: &mut HashSet<String>) {
+        match expr {
+            CExpression::BinaryOp { left, op: BinOp::Assign, .. } => {
+                if let CExpression::Variable(name) = left.as_ref() {
+                    set.insert(name.clone());
+                }
+            }
+            CExpression::BinaryOp { left, right, .. } => {
+                Self::from_expr_assignments(left, set);
+                Self::from_expr_assignments(right, set);
             }
             _ => {}
         }

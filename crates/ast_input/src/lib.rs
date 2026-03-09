@@ -487,6 +487,23 @@ unsafe fn extract_compound_stmt(cursor: clang_sys::CXCursor) -> Vec<CStatement> 
         data: CXClientData,
     ) -> CXChildVisitResult {
         let ctx = unsafe { &mut *(data as *mut Ctx) };
+        // Expand DeclStmt into ALL its VarDecl children, not just the first.
+        // This handles `int i, j, temp;` correctly.
+        if unsafe { clang_getCursorKind(cursor) } == CXCursor_DeclStmt {
+            let mut decls: Vec<CStatement> = Vec::new();
+            extern "C" fn dv(c: CXCursor, _p: CXCursor, d: CXClientData) -> CXChildVisitResult {
+                let decls = unsafe { &mut *(d as *mut Vec<CStatement>) };
+                if unsafe { clang_getCursorKind(c) } == CXCursor_VarDecl {
+                    if let Some(s) = unsafe { extract_var_decl(c) } {
+                        decls.push(s);
+                    }
+                }
+                CXChildVisit_Continue
+            }
+            unsafe { clang_visitChildren(cursor, dv, &mut decls as *mut _ as CXClientData) };
+            ctx.stmts.extend(decls);
+            return CXChildVisit_Continue;
+        }
         if let Some(s) = unsafe { extract_stmt(cursor) } {
             ctx.stmts.push(s);
         }
@@ -726,9 +743,22 @@ unsafe fn extract_expr(cursor: clang_sys::CXCursor) -> Option<CExpression> {
             Some(CExpression::FieldAccess { object: Box::new(object), field })
         }
         CXCursor_InitListExpr => {
-            let raw = type_spelling(clang_getCursorType(cursor));
-            let struct_type = raw.trim_start_matches("struct ").to_string();
+            let cx_type = clang_getCursorType(cursor);
+            let type_kind = cx_type.kind;
             let ch = collect_children(cursor);
+            // Array types (ConstantArray, VariableArray, IncompleteArray) → ArrayLiteral
+            if type_kind == clang_sys::CXType_ConstantArray
+                || type_kind == clang_sys::CXType_VariableArray
+                || type_kind == clang_sys::CXType_IncompleteArray
+            {
+                let elems = ch.iter()
+                    .filter_map(|&c| extract_expr(c))
+                    .collect();
+                return Some(CExpression::ArrayLiteral(elems));
+            }
+            // Struct / record types → StructLiteral
+            let raw = type_spelling(cx_type);
+            let struct_type = raw.trim_start_matches("struct ").to_string();
             let fields = ch.iter().enumerate()
                 .filter_map(|(i, &c)| extract_expr(c).map(|e| (format!("_field{}", i), e)))
                 .collect();
@@ -839,24 +869,40 @@ unsafe fn extract_unary(cursor: clang_sys::CXCursor) -> Option<CExpression> {
     let mut n: u32 = 0;
     clang_tokenize(tu, range, &mut toks, &mut n);
 
-    let mut op_str = String::new();
+    let mut op_str    = String::new();
+    let mut is_prefix = true;   // is the operator *before* the operand?
     if !toks.is_null() && n > 0 {
         let tokens = std::slice::from_raw_parts(toks, n as usize);
+        // Token 0 is prefix operator if it is punctuation.
+        // For postfix i++ / i-- the token order is: ident, operator.
         if clang_getTokenKind(tokens[0]) == CXToken_Punctuation {
             op_str = cx_string(clang_getTokenSpelling(tu, tokens[0]));
+            is_prefix = true;
+        } else if n >= 2 && clang_getTokenKind(tokens[n as usize - 1]) == CXToken_Punctuation {
+            // Postfix: operator is the last token
+            op_str = cx_string(clang_getTokenSpelling(tu, tokens[n as usize - 1]));
+            is_prefix = false;
         }
         clang_disposeTokens(tu, toks, n);
     }
 
     let operand = first_child_expr(cursor)?;
 
+    // For postfix ++ / -- the semantics are identical to prefix for statement-level use.
+    // We lower both to: operand = operand + 1 (assignment expression).
     match op_str.as_str() {
-        "-"  => Some(CExpression::UnaryOp { op: UnaryOp::Neg,    operand: Box::new(operand) }),
-        "!"  => Some(CExpression::UnaryOp { op: UnaryOp::Not,    operand: Box::new(operand) }),
-        "*"  => Some(CExpression::UnaryOp { op: UnaryOp::Deref,  operand: Box::new(operand) }),
-        "&"  => Some(CExpression::UnaryOp { op: UnaryOp::AddrOf, operand: Box::new(operand) }),
-        "~"  => Some(CExpression::UnaryOp { op: UnaryOp::BitNot, operand: Box::new(operand) }),
+        "-"  if is_prefix =>
+            Some(CExpression::UnaryOp { op: UnaryOp::Neg,    operand: Box::new(operand) }),
+        "!"  =>
+            Some(CExpression::UnaryOp { op: UnaryOp::Not,    operand: Box::new(operand) }),
+        "*"  if is_prefix =>
+            Some(CExpression::UnaryOp { op: UnaryOp::Deref,  operand: Box::new(operand) }),
+        "&"  if is_prefix =>
+            Some(CExpression::UnaryOp { op: UnaryOp::AddrOf, operand: Box::new(operand) }),
+        "~"  =>
+            Some(CExpression::UnaryOp { op: UnaryOp::BitNot, operand: Box::new(operand) }),
         "++" | "--" => {
+            // Both prefix (++i) and postfix (i++) lower to `i = i OP 1`.
             let bin_op = if op_str == "++" { BinOp::Add } else { BinOp::Sub };
             Some(CExpression::BinaryOp {
                 left: Box::new(operand.clone()),

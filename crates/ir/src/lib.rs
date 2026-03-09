@@ -579,12 +579,20 @@ impl IrBuilder {
                 body: Self::build_stmts(body, sem, struct_fields, fn_param_types)?,
             },
 
-            CS::For { init, condition, increment, body } => IrStatement::While2 {
-                init: Box::new(Self::build_stmt(init, sem, struct_fields, fn_param_types)?),
-                condition: Self::build_expr(condition, sem, struct_fields, fn_param_types)?,
-                increment: Self::build_expr(increment, sem, struct_fields, fn_param_types)?,
-                body: Self::build_stmts(body, sem, struct_fields, fn_param_types)?,
-            },
+            CS::For { init, condition, increment, body } => {
+                // Build the init statement, then force it to be mutable —
+                // the loop variable is always written by the increment expression.
+                let mut init_stmt = Self::build_stmt(init, sem, struct_fields, fn_param_types)?;
+                if let IrStatement::LetBinding { ref mut is_mutable, .. } = init_stmt {
+                    *is_mutable = true;
+                }
+                IrStatement::While2 {
+                    init: Box::new(init_stmt),
+                    condition: Self::build_expr(condition, sem, struct_fields, fn_param_types)?,
+                    increment: Self::build_expr(increment, sem, struct_fields, fn_param_types)?,
+                    body: Self::build_stmts(body, sem, struct_fields, fn_param_types)?,
+                }
+            }
 
             CS::StructDecl { name, struct_type, fields } => {
                 let real_names = struct_fields.get(struct_type);

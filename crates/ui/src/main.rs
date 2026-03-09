@@ -13,6 +13,24 @@
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::process::Command;
+
+// Suppress flash of console window for each subprocess on Windows.
+// On other platforms this is a no-op.
+trait NoWindow {
+    fn no_window(&mut self) -> &mut Self;
+}
+impl NoWindow for Command {
+    fn no_window(&mut self) -> &mut Self {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            self.creation_flags(CREATE_NO_WINDOW);
+        }
+        self
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Translation result (shared across threads)
@@ -231,13 +249,13 @@ fn run_c_code(c_source: &str, result_slot: Arc<Mutex<Option<TranslationResult>>>
 }
 
 fn do_run_c(source: &str) -> String {
-    use std::process::Command;
     let tmp = std::env::temp_dir().join(format!("diagrust_c_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let src = tmp.join("main.c");
     let bin = tmp.join("main_c");
     if std::fs::write(&src, source).is_err() { return "Failed to write C source".into(); }
-    let compile = Command::new("gcc").arg(&src).arg("-o").arg(&bin).arg("-lm")
+    let compile = Command::new("gcc").no_window()
+        .arg(&src).arg("-o").arg(&bin).arg("-lm")
         .output();
     match compile {
         Err(_) => "gcc not found — cannot run C code".into(),
@@ -245,7 +263,7 @@ fn do_run_c(source: &str) -> String {
             format!("Compile error:\n{}", String::from_utf8_lossy(&out.stderr))
         }
         Ok(_) => {
-            match Command::new(&bin).output() {
+            match Command::new(&bin).no_window().output() {
                 Err(e) => format!("Run error: {}", e),
                 Ok(out) => {
                     let _ = std::fs::remove_dir_all(&tmp);
@@ -269,13 +287,13 @@ fn run_rust_code(rust_source: &str, result_slot: Arc<Mutex<Option<TranslationRes
 }
 
 fn do_run_rust(source: &str) -> String {
-    use std::process::Command;
     let tmp = std::env::temp_dir().join(format!("diagrust_rs_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let src = tmp.join("main.rs");
     let bin = tmp.join("main_rs");
     if std::fs::write(&src, source).is_err() { return "Failed to write Rust source".into(); }
-    let compile = Command::new("rustc").arg("--edition=2021").arg(&src).arg("-o").arg(&bin)
+    let compile = Command::new("rustc").no_window()
+        .arg("--edition=2021").arg(&src).arg("-o").arg(&bin)
         .output();
     match compile {
         Err(_) => "rustc not found".into(),
@@ -283,7 +301,7 @@ fn do_run_rust(source: &str) -> String {
             format!("Compile error:\n{}", String::from_utf8_lossy(&out.stderr))
         }
         Ok(_) => {
-            match Command::new(&bin).output() {
+            match Command::new(&bin).no_window().output() {
                 Err(e) => format!("Run error: {}", e),
                 Ok(out) => {
                     let _ = std::fs::remove_dir_all(&tmp);

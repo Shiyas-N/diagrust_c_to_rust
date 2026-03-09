@@ -1,0 +1,22 @@
+[package]
+name = "diagrust-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "DIAGRUST GUI — eframe/egui frontend for the C→Rust transpiler"
+
+[[bin]]
+name = "diagrust-ui"
+path = "src/main.rs"
+
+[dependencies]
+eframe        = "0.27"
+egui          = "0.27"
+anyhow        = { workspace = true }
+serde_json    = { workspace = true }
+ast_input     = { path = "../ast_input" }
+semantic      = { path = "../semantic" }
+ir            = { path = "../ir" }
+codegen       = { path = "../codegen" }
+compiler_loop = { path = "../compiler_loop" }
+reporting     = { path = "../reporting" }

@@ -1,44 +1,34 @@
 //! # Intermediate Representation (IR)
-//!
-//! A typed, language-neutral IR that sits between the C AST + semantic model
-//! and the Rust code generator.  This layer ensures:
-//!  - Clear separation between analysis and code generation
-//!  - Safe transformation decisions driven by semantic findings
-//!  - Improved maintainability and extensibility
-//!
-//! Each `IrFunction` mirrors a C function but uses Rust-typed nodes,
-//! ownership annotations, and resolved lifetimes.
 
-use ast_input::{BinOp, CType, UnaryOp};
-use semantic::{OwnershipKind, RustType, SemanticModel};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use ast_input::{BinOp, CType, UnaryOp, CProgram, CStatement, CExpression};
+use semantic::{OwnershipKind, SemanticModel};
+use std::collections::{HashMap, HashSet};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IR types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A struct field in the IR (mirrors CStructField).
 #[derive(Debug, Clone)]
-pub struct IrStructField {
+pub struct IrStructField { pub name: String, pub rust_type: String }
+
+#[derive(Debug, Clone)]
+pub struct IrStructDef { pub name: String, pub fields: Vec<IrStructField> }
+
+#[derive(Debug, Clone)]
+pub struct IrGlobalVar {
     pub name: String,
     pub rust_type: String,
-}
-
-/// A struct definition in the IR.
-#[derive(Debug, Clone)]
-pub struct IrStructDef {
-    pub name: String,
-    pub fields: Vec<IrStructField>,
+    pub init: Option<IrExpr>,
+    pub is_const: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct IrProgram {
     pub functions: Vec<IrFunction>,
-    /// Struct definitions to emit as Rust structs.
     pub structs: Vec<IrStructDef>,
-    /// Set of `use` declarations needed at the top of the output file.
+    pub global_vars: Vec<IrGlobalVar>,
     pub required_uses: Vec<String>,
+    pub is_executable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +38,7 @@ pub struct IrFunction {
     pub parameters: Vec<IrParameter>,
     pub body: Vec<IrStatement>,
     pub requires_unsafe: bool,
+    pub is_main: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,194 +51,467 @@ pub struct IrParameter {
 
 #[derive(Debug, Clone)]
 pub enum IrStatement {
-    /// `let [mut] name: rust_type = value;`
-    LetBinding {
-        name: String,
-        rust_type: String,
-        init: Option<IrExpr>,
-        is_mutable: bool,
-    },
-    /// `name = value;`
-    Assign {
-        target: String,
-        value: IrExpr,
-    },
-    /// `array[index] = value;`
-    IndexAssign {
-        array: String,
-        index: IrExpr,
-        value: IrExpr,
-    },
-    /// `return expr;` or `return;`
+    LetBinding  { name: String, rust_type: String, init: Option<IrExpr>, is_mutable: bool },
+    Assign      { target: String, value: IrExpr },
+    IndexAssign { array: String, index: IrExpr, value: IrExpr },
+    FieldAssign { object: String, field: String, value: IrExpr },
     Return(Option<IrExpr>),
-    /// `if cond { then } [else { else }]`
-    If {
-        condition: IrExpr,
-        then_block: Vec<IrStatement>,
-        else_block: Option<Vec<IrStatement>>,
-    },
-    /// `while cond { body }`
-    While {
-        condition: IrExpr,
-        body: Vec<IrStatement>,
-    },
-    /// Desugared for loop → while
-    While2 {
-        init: Box<IrStatement>,
-        condition: IrExpr,
-        increment: IrExpr,
-        body: Vec<IrStatement>,
-    },
-    /// `break;`
-    Break,
-    /// `continue;`
-    Continue,
-    /// Standalone expression statement
+    If      { condition: IrExpr, then_block: Vec<IrStatement>, else_block: Option<Vec<IrStatement>> },
+    While   { condition: IrExpr, body: Vec<IrStatement> },
+    While2  { init: Box<IrStatement>, condition: IrExpr, increment: IrExpr, body: Vec<IrStatement> },
+    Break, Continue,
     Expr(IrExpr),
-    /// Block of unsafe code
     UnsafeBlock(Vec<IrStatement>),
+    Drop(String),
+    /// Swap two array elements in-place: arr.swap(i, j)
+    SwapElements { array: String, i: IrExpr, j: IrExpr },
 }
 
 #[derive(Debug, Clone)]
 pub enum IrExpr {
-    IntLit(i64),
-    FloatLit(f64),
-    BoolLit(bool),
-    StringLit(String),
-    CharLit(char),
-    Null,
-    Var(String),
-    BinOp { left: Box<IrExpr>, op: BinOp, right: Box<IrExpr> },
-    UnaryOp { op: UnaryOp, operand: Box<IrExpr> },
-    Call { function: String, args: Vec<IrExpr> },
-    ArrayAccess { array: Box<IrExpr>, index: Box<IrExpr> },
+    IntLit(i64), FloatLit(f64), BoolLit(bool), StringLit(String), CharLit(char),
+    Null, Var(String),
+    BinOp    { left: Box<IrExpr>, op: BinOp, right: Box<IrExpr> },
+    UnaryOp  { op: UnaryOp, operand: Box<IrExpr> },
+    Call     { function: String, args: Vec<IrExpr> },
+    ArrayAccess  { array: Box<IrExpr>, index: Box<IrExpr> },
     ArrayLiteral(Vec<IrExpr>),
-    Cast { to_type: String, expr: Box<IrExpr> },
-    /// `expr as usize` for array indexing
+    Cast     { to_type: String, expr: Box<IrExpr> },
     AsUsize(Box<IrExpr>),
-    /// `Box::new(expr)`
-    BoxNew(Box<IrExpr>),
-    /// `Rc::new(expr)`
-    RcNew(Box<IrExpr>),
-    /// `RefCell::new(expr)`
-    RefCellNew(Box<IrExpr>),
-    /// `std::ptr::null_mut()`
-    NullMut,
-    /// `None`
-    OptionNone,
-    /// `Some(expr)`
-    OptionSome(Box<IrExpr>),
-    /// `obj.field`
-    FieldAccess { object: Box<IrExpr>, field: String },
-    /// Struct initialiser `TypeName { field: val, .. }`
+    BoxNew(Box<IrExpr>), RcNew(Box<IrExpr>), RefCellNew(Box<IrExpr>),
+    NullMut, OptionNone, OptionSome(Box<IrExpr>),
+    FieldAccess  { object: Box<IrExpr>, field: String },
     StructLiteral { struct_type: String, fields: Vec<(String, IrExpr)> },
+    StructDefault(String),
+    VecNew { elem_type: String, len: Box<IrExpr> },
+    Deref(Box<IrExpr>),
+    Ref(Box<IrExpr>),       // &expr
+    RefMut(Box<IrExpr>),    // &mut expr
+    Clone(Box<IrExpr>),     // expr.clone()
+    PrintLn { fmt: String, args: Vec<IrExpr> },
+    Print   { fmt: String, args: Vec<IrExpr> },
+    EPrintLn { fmt: String, args: Vec<IrExpr> },
+    ReadLine { var: String },
+    Exit(Box<IrExpr>),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IR builder – lowers C AST + semantic model into IR
+// IR Builder
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct IrBuilder;
 
 impl IrBuilder {
-    pub fn build(
-        program: &ast_input::CProgram,
-        semantic: &SemanticModel,
-    ) -> anyhow::Result<IrProgram> {
+    pub fn build(program: &CProgram, semantic: &SemanticModel) -> anyhow::Result<IrProgram> {
         let mut functions = Vec::new();
-        let mut required_uses: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut required_uses: HashSet<String> = Default::default();
+
+        let struct_fields: HashMap<String, Vec<String>> = program.structs.iter()
+            .map(|s| (s.name.clone(), s.fields.iter().map(|f| f.name.clone()).collect()))
+            .collect();
+
+        let global_names: HashSet<String> = program.global_vars.iter()
+            .map(|g| g.name.clone())
+            .collect();
+
+        // fn_param_types: fn_name -> Vec<rust_type_string>
+        // Uses slice types for array/pointer params where indexed in body
+        let fn_param_types: HashMap<String, Vec<String>> = program.functions.iter().map(|f| {
+            let array_params = Self::detect_array_params(f);
+            let types: Vec<String> = f.parameters.iter().map(|p| {
+                if array_params.contains(&p.name) {
+                    let inner = match &p.param_type {
+                        CType::Pointer(inner) | CType::Array(inner, _) => Self::fallback_type(inner),
+                        other => Self::fallback_type(other),
+                    };
+                    format!("&mut [{}]", inner)
+                } else {
+                    Self::fallback_type(&p.param_type)
+                }
+            }).collect();
+            (f.name.clone(), types)
+        }).collect();
 
         for (func, sem) in program.functions.iter().zip(semantic.functions.iter()) {
-            let ir_func = Self::build_function(func, sem, &mut required_uses)?;
+            let ir_func = Self::build_function(
+                func, sem, &mut required_uses, &struct_fields, &global_names, &fn_param_types
+            )?;
             functions.push(ir_func);
         }
 
-        // Convert CStructDefs to IrStructDefs
-        let structs: Vec<IrStructDef> = program.structs.iter().map(|sd| {
-            IrStructDef {
-                name: sd.name.clone(),
-                fields: sd.fields.iter().map(|f| IrStructField {
-                    name: f.name.clone(),
-                    rust_type: Self::fallback_type(&f.field_type),
-                }).collect(),
-            }
+        let global_vars = program.global_vars.iter().map(|gv| {
+            let rust_type = Self::fallback_type(&gv.var_type);
+            let init = gv.init.as_ref().and_then(|e| {
+                let dummy_sem = semantic::FunctionSemantics::empty();
+                Self::build_expr(e, &dummy_sem, &struct_fields, &HashMap::new()).ok()
+            });
+            IrGlobalVar { name: gv.name.clone(), rust_type, init, is_const: gv.is_const }
+        }).collect();
+
+        if program.has_main {
+            required_uses.insert("std::io::{self, Write}".to_string());
+        }
+
+        let structs = program.structs.iter().map(|sd| IrStructDef {
+            name: sd.name.clone(),
+            fields: sd.fields.iter().map(|f| IrStructField {
+                name: f.name.clone(),
+                rust_type: Self::fallback_type(&f.field_type),
+            }).collect(),
         }).collect();
 
         Ok(IrProgram {
             functions,
             structs,
+            global_vars,
             required_uses: required_uses.into_iter().collect(),
+            is_executable: program.has_main,
         })
+    }
+
+    /// Detect which function parameters are used as arrays (indexed with []).
+    fn detect_array_params(func: &ast_input::CFunction) -> HashSet<String> {
+        let param_names: HashSet<&str> = func.parameters.iter().map(|p| p.name.as_str()).collect();
+        let mut array_params = HashSet::new();
+        Self::scan_stmts_for_array_params(&func.body, &param_names, &mut array_params);
+        array_params
+    }
+
+    fn scan_stmts_for_array_params(
+        stmts: &[CStatement],
+        params: &HashSet<&str>,
+        out: &mut HashSet<String>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                CStatement::IndexedAssignment { array, .. } => {
+                    if params.contains(array.as_str()) { out.insert(array.clone()); }
+                }
+                CStatement::Expression(e) | CStatement::Return(Some(e)) => {
+                    Self::scan_expr_for_array_params(e, params, out);
+                }
+                CStatement::VarDecl { init: Some(e), .. } => {
+                    Self::scan_expr_for_array_params(e, params, out);
+                }
+                CStatement::Assignment { value, .. } => {
+                    Self::scan_expr_for_array_params(value, params, out);
+                }
+                CStatement::If { condition, then_body, else_body } => {
+                    Self::scan_expr_for_array_params(condition, params, out);
+                    Self::scan_stmts_for_array_params(then_body, params, out);
+                    if let Some(eb) = else_body {
+                        Self::scan_stmts_for_array_params(eb, params, out);
+                    }
+                }
+                CStatement::While { condition, body } => {
+                    Self::scan_expr_for_array_params(condition, params, out);
+                    Self::scan_stmts_for_array_params(body, params, out);
+                }
+                CStatement::For { init, condition, increment, body } => {
+                    Self::scan_stmts_for_array_params(std::slice::from_ref(init), params, out);
+                    Self::scan_expr_for_array_params(condition, params, out);
+                    Self::scan_expr_for_array_params(increment, params, out);
+                    Self::scan_stmts_for_array_params(body, params, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scan_expr_for_array_params(
+        expr: &CExpression,
+        params: &HashSet<&str>,
+        out: &mut HashSet<String>,
+    ) {
+        match expr {
+            CExpression::ArrayAccess { array, index } => {
+                if let CExpression::Variable(name) = array.as_ref() {
+                    if params.contains(name.as_str()) {
+                        out.insert(name.clone());
+                    }
+                }
+                Self::scan_expr_for_array_params(array, params, out);
+                Self::scan_expr_for_array_params(index, params, out);
+            }
+            CExpression::BinaryOp { left, right, .. } => {
+                Self::scan_expr_for_array_params(left, params, out);
+                Self::scan_expr_for_array_params(right, params, out);
+            }
+            CExpression::Call { args, .. } => {
+                for a in args { Self::scan_expr_for_array_params(a, params, out); }
+            }
+            CExpression::UnaryOp { operand, .. } => {
+                Self::scan_expr_for_array_params(operand, params, out);
+            }
+            _ => {}
+        }
     }
 
     fn build_function(
         func: &ast_input::CFunction,
         sem: &semantic::FunctionSemantics,
-        uses: &mut std::collections::HashSet<String>,
+        uses: &mut HashSet<String>,
+        struct_fields: &HashMap<String, Vec<String>>,
+        global_names: &HashSet<String>,
+        fn_param_types: &HashMap<String, Vec<String>>,
     ) -> anyhow::Result<IrFunction> {
-        // Parameters
-        let parameters: Vec<IrParameter> = func
-            .parameters
-            .iter()
-            .map(|p| {
-                let rt = sem.rust_type_map.get(&p.name)
-                    .map(|r| r.rust_repr.clone())
-                    .unwrap_or_else(|| Self::fallback_type(&p.param_type));
-                let ownership = sem.ownership_map.get(&p.name)
-                    .cloned()
-                    .unwrap_or(OwnershipKind::Value);
-                let is_mutable = sem.mutable_vars.contains(&p.name);
-                IrParameter { name: p.name.clone(), rust_type: rt, is_mutable, ownership }
-            })
-            .collect();
+        let is_main = func.name == "main";
 
-        // Determine if any unsafe needed
+        // Detect which params are used as arrays in this function
+        let array_params = Self::detect_array_params(func);
+
+        let parameters: Vec<IrParameter> = if is_main {
+            vec![]
+        } else {
+            func.parameters.iter().map(|p| {
+                // Use slice type for array-indexed params
+                let rt = if array_params.contains(&p.name) {
+                    let inner = match &p.param_type {
+                        CType::Pointer(inner) | CType::Array(inner, _) => Self::fallback_type(inner),
+                        other => Self::fallback_type(other),
+                    };
+                    format!("&mut [{}]", inner)
+                } else {
+                    sem.rust_type_map.get(&p.name)
+                        .map(|r| r.rust_repr.clone())
+                        .unwrap_or_else(|| Self::fallback_type(&p.param_type))
+                };
+                let ownership = sem.ownership_map.get(&p.name).cloned().unwrap_or(OwnershipKind::Value);
+                // Slice params are always mutable (they're &mut [...])
+                let is_mut = array_params.contains(&p.name) || sem.mutable_vars.contains(&p.name);
+                IrParameter { name: p.name.clone(), rust_type: rt, is_mutable: is_mut, ownership }
+            }).collect()
+        };
+
         let requires_unsafe = sem.rust_type_map.values().any(|rt| rt.requires_unsafe);
-
-        if requires_unsafe {
-            uses.insert("std::ptr".to_string());
-        }
-
-        // Check if Rc needed
-        let needs_rc = sem.ownership_map.values().any(|o| *o == OwnershipKind::SharedOwned);
-        if needs_rc {
+        if requires_unsafe { uses.insert("std::ptr".to_string()); }
+        if sem.ownership_map.values().any(|o| *o == OwnershipKind::SharedOwned) {
             uses.insert("std::rc::Rc".to_string());
         }
-
-        // Check if RefCell needed
-        let needs_refcell = sem.ownership_map.values().any(|o| *o == OwnershipKind::InteriorMutable);
-        if needs_refcell {
+        if sem.ownership_map.values().any(|o| *o == OwnershipKind::InteriorMutable) {
             uses.insert("std::cell::RefCell".to_string());
         }
 
-        let rust_return_type = Self::fallback_type(&func.return_type);
+        let rust_return_type = if is_main { "()".to_string() } else { Self::fallback_type(&func.return_type) };
 
-        // Build body
-        let body = Self::build_stmts(&func.body, sem)?;
+        let raw_body = Self::build_stmts(&func.body, sem, struct_fields, fn_param_types)?;
+        let raw_body = if is_main { Self::strip_main_return(raw_body) } else { raw_body };
 
-        Ok(IrFunction {
-            name: func.name.clone(),
-            rust_return_type,
-            parameters,
-            body,
-            requires_unsafe,
-        })
+        // Detect and rewrite swap patterns before wrapping globals
+        let raw_body = Self::rewrite_swap_patterns(raw_body);
+
+        // Wrap global accesses: hoist let-bindings outside unsafe blocks
+        let (body, needs_unsafe_for_globals) = if !global_names.is_empty() {
+            Self::wrap_global_accesses(raw_body, global_names, requires_unsafe)
+        } else {
+            (raw_body, false)
+        };
+
+        let requires_unsafe = requires_unsafe || needs_unsafe_for_globals;
+
+        Ok(IrFunction { name: func.name.clone(), rust_return_type, parameters, body, requires_unsafe, is_main })
+    }
+
+    /// Detect `tmp = a[i]; a[i] = a[j]; a[j] = tmp;` patterns and replace with SwapElements.
+    fn rewrite_swap_patterns(stmts: Vec<IrStatement>) -> Vec<IrStatement> {
+        let mut out = Vec::with_capacity(stmts.len());
+        let mut i = 0;
+        while i < stmts.len() {
+            // Look for 3-statement swap pattern:
+            //   let tmp = arr[idx_a];
+            //   arr[idx_a] = arr[idx_b];
+            //   arr[idx_b] = tmp;
+            if i + 2 < stmts.len() {
+                if let Some(swap) = Self::try_match_swap(&stmts[i], &stmts[i+1], &stmts[i+2]) {
+                    out.push(swap);
+                    i += 3;
+                    continue;
+                }
+            }
+            // Recurse into blocks
+            let stmt = match stmts[i].clone() {
+                IrStatement::If { condition, then_block, else_block } => IrStatement::If {
+                    condition,
+                    then_block: Self::rewrite_swap_patterns(then_block),
+                    else_block: else_block.map(Self::rewrite_swap_patterns),
+                },
+                IrStatement::While { condition, body } => IrStatement::While {
+                    condition,
+                    body: Self::rewrite_swap_patterns(body),
+                },
+                IrStatement::While2 { init, condition, increment, body } => IrStatement::While2 {
+                    init,
+                    condition,
+                    increment,
+                    body: Self::rewrite_swap_patterns(body),
+                },
+                IrStatement::UnsafeBlock(inner) => IrStatement::UnsafeBlock(
+                    Self::rewrite_swap_patterns(inner)
+                ),
+                other => other,
+            };
+            out.push(stmt);
+            i += 1;
+        }
+        out
+    }
+
+    fn try_match_swap(s0: &IrStatement, s1: &IrStatement, s2: &IrStatement) -> Option<IrStatement> {
+        // s0: let tmp: T = arr[i];
+        // s1: arr[i] = arr[j];
+        // s2: arr[j] = tmp;
+        let (tmp_name, arr_name0, idx_i) = match s0 {
+            IrStatement::LetBinding { name: tmp, init: Some(IrExpr::ArrayAccess { array, index }), .. } => {
+                if let IrExpr::Var(arr) = array.as_ref() {
+                    (tmp.clone(), arr.clone(), index.as_ref().clone())
+                } else { return None; }
+            }
+            _ => return None,
+        };
+        let (arr_name1, idx_i2, idx_j) = match s1 {
+            IrStatement::IndexAssign { array: arr, index: idx_i2, value: IrExpr::ArrayAccess { array: arr2, index: idx_j } } => {
+                if let IrExpr::Var(arr2) = arr2.as_ref() {
+                    if arr == arr2 { (arr.clone(), idx_i2.clone(), idx_j.as_ref().clone()) } else { return None; }
+                } else { return None; }
+            }
+            _ => return None,
+        };
+        let (arr_name2, idx_j2, src) = match s2 {
+            IrStatement::IndexAssign { array: arr, index: idx_j2, value: IrExpr::Var(src) } => {
+                (arr.clone(), idx_j2.clone(), src.clone())
+            }
+            _ => return None,
+        };
+
+        if arr_name0 == arr_name1 && arr_name1 == arr_name2
+            && src == tmp_name
+            && expr_eq(&idx_i, &idx_i2) && expr_eq(&idx_j, &idx_j2)
+        {
+            Some(IrStatement::SwapElements { array: arr_name0, i: idx_i, j: idx_j })
+        } else {
+            None
+        }
+    }
+
+    /// Wrap statements that touch global (static mut) variables in unsafe blocks.
+    /// Hoists LetBinding declarations outside the unsafe block to prevent scope errors.
+    /// When `already_unsafe` is true, no wrapper is emitted (prevents nesting).
+    fn wrap_global_accesses(
+        stmts: Vec<IrStatement>,
+        globals: &HashSet<String>,
+        already_unsafe: bool,
+    ) -> (Vec<IrStatement>, bool) {
+        if globals.is_empty() { return (stmts, false); }
+        let mut out = Vec::new();
+        let mut wrapped = false;
+        let mut unsafe_buf: Vec<IrStatement> = Vec::new();
+        // Hoisted declarations that need to live outside unsafe
+        let mut hoisted: Vec<IrStatement> = Vec::new();
+
+        for stmt in stmts {
+            if Self::stmt_touches_globals(&stmt, globals) {
+                wrapped = true;
+                // Hoist LetBinding declarations outside the unsafe block
+                if let IrStatement::LetBinding { name, rust_type, init: Some(_), is_mutable } = &stmt {
+                    // Split: hoist uninitialized binding, keep init assignment inside unsafe
+                    let hoisted_decl = IrStatement::LetBinding {
+                        name: name.clone(),
+                        rust_type: rust_type.clone(),
+                        init: None,
+                        is_mutable: *is_mutable,
+                    };
+                    if !already_unsafe {
+                        if !unsafe_buf.is_empty() {
+                            out.extend(hoisted.drain(..));
+                            out.push(IrStatement::UnsafeBlock(std::mem::take(&mut unsafe_buf)));
+                        }
+                        out.push(hoisted_decl);
+                        // Put the assignment inside unsafe
+                        if let IrStatement::LetBinding { name, init: Some(init_expr), .. } = stmt {
+                            unsafe_buf.push(IrStatement::Assign { target: name, value: init_expr });
+                        }
+                    } else {
+                        unsafe_buf.push(stmt);
+                    }
+                } else {
+                    unsafe_buf.push(stmt);
+                }
+            } else {
+                if !unsafe_buf.is_empty() {
+                    out.extend(hoisted.drain(..));
+                    if already_unsafe {
+                        out.extend(std::mem::take(&mut unsafe_buf));
+                    } else {
+                        out.push(IrStatement::UnsafeBlock(std::mem::take(&mut unsafe_buf)));
+                    }
+                }
+                out.push(stmt);
+            }
+        }
+        if !unsafe_buf.is_empty() {
+            out.extend(hoisted.drain(..));
+            if already_unsafe {
+                out.extend(unsafe_buf);
+            } else {
+                out.push(IrStatement::UnsafeBlock(unsafe_buf));
+            }
+        }
+        (out, wrapped)
+    }
+
+    fn stmt_touches_globals(stmt: &IrStatement, globals: &HashSet<String>) -> bool {
+        match stmt {
+            IrStatement::UnsafeBlock(_) => false,
+            IrStatement::Assign { target, value } =>
+                globals.contains(target) || Self::expr_touches_globals(value, globals),
+            IrStatement::LetBinding { init: Some(e), .. } => Self::expr_touches_globals(e, globals),
+            IrStatement::Expr(e) => Self::expr_touches_globals(e, globals),
+            IrStatement::Return(Some(e)) => Self::expr_touches_globals(e, globals),
+            IrStatement::FieldAssign { object, value, .. } =>
+                globals.contains(object) || Self::expr_touches_globals(value, globals),
+            IrStatement::IndexAssign { array, index, value } =>
+                globals.contains(array)
+                || Self::expr_touches_globals(index, globals)
+                || Self::expr_touches_globals(value, globals),
+            _ => false,
+        }
+    }
+
+    fn expr_touches_globals(expr: &IrExpr, globals: &HashSet<String>) -> bool {
+        match expr {
+            IrExpr::Var(n) => globals.contains(n),
+            IrExpr::BinOp { left, right, .. } =>
+                Self::expr_touches_globals(left, globals) || Self::expr_touches_globals(right, globals),
+            IrExpr::ArrayAccess { array, index } =>
+                Self::expr_touches_globals(array, globals) || Self::expr_touches_globals(index, globals),
+            IrExpr::FieldAccess { object, .. } => Self::expr_touches_globals(object, globals),
+            IrExpr::Call { args, .. } => args.iter().any(|a| Self::expr_touches_globals(a, globals)),
+            IrExpr::Deref(e) | IrExpr::UnaryOp { operand: e, .. } => Self::expr_touches_globals(e, globals),
+            _ => false,
+        }
+    }
+
+    fn strip_main_return(stmts: Vec<IrStatement>) -> Vec<IrStatement> {
+        stmts.into_iter().filter(|s| {
+            !matches!(s, IrStatement::Return(Some(IrExpr::IntLit(0)))
+                       | IrStatement::Return(None))
+        }).collect()
     }
 
     fn build_stmts(
-        stmts: &[ast_input::CStatement],
+        stmts: &[CStatement],
         sem: &semantic::FunctionSemantics,
+        struct_fields: &HashMap<String, Vec<String>>,
+        fn_param_types: &HashMap<String, Vec<String>>,
     ) -> anyhow::Result<Vec<IrStatement>> {
-        let mut result = Vec::new();
-        for stmt in stmts {
-            result.push(Self::build_stmt(stmt, sem)?);
-        }
-        Ok(result)
+        stmts.iter().map(|s| Self::build_stmt(s, sem, struct_fields, fn_param_types)).collect()
     }
 
     fn build_stmt(
-        stmt: &ast_input::CStatement,
+        stmt: &CStatement,
         sem: &semantic::FunctionSemantics,
+        struct_fields: &HashMap<String, Vec<String>>,
+        fn_param_types: &HashMap<String, Vec<String>>,
     ) -> anyhow::Result<IrStatement> {
         use ast_input::CStatement as CS;
         Ok(match stmt {
@@ -255,90 +519,304 @@ impl IrBuilder {
                 let rust_type = sem.rust_type_map.get(name)
                     .map(|r| r.rust_repr.clone())
                     .unwrap_or_else(|| Self::fallback_type(var_type));
-                let is_mutable = sem.mutable_vars.contains(name);
-                let init_ir = if let Some(e) = init {
-                    Some(Self::build_expr(e, sem)?)
-                } else {
-                    None
+                let is_mutable = sem.mutable_vars.contains(name) || init.is_none();
+                let init_ir = match init {
+                    Some(e) => Some(Self::build_expr(e, sem, struct_fields, fn_param_types)?),
+                    None    => None,
                 };
                 IrStatement::LetBinding { name: name.clone(), rust_type, init: init_ir, is_mutable }
             }
+
             CS::Assignment { target, value } => {
-                let value_ir = Self::build_expr(value, sem)?;
-                IrStatement::Assign { target: target.clone(), value: value_ir }
-            }
-            CS::IndexedAssignment { array, index, value } => {
-                let index_ir = Self::build_index_expr(index, sem)?;
-                let value_ir = Self::build_expr(value, sem)?;
-                IrStatement::IndexAssign { array: array.clone(), index: index_ir, value: value_ir }
-            }
-            CS::Return(Some(e)) => IrStatement::Return(Some(Self::build_expr(e, sem)?)),
-            CS::Return(None) => IrStatement::Return(None),
-            CS::Break => IrStatement::Break,
-            CS::Continue => IrStatement::Continue,
-            CS::Expression(e) => IrStatement::Expr(Self::build_expr(e, sem)?),
-            CS::If { condition, then_body, else_body } => {
-                let cond = Self::build_expr(condition, sem)?;
-                let then_b = Self::build_stmts(then_body, sem)?;
-                let else_b = if let Some(eb) = else_body {
-                    Some(Self::build_stmts(eb, sem)?)
-                } else {
-                    None
-                };
-                IrStatement::If { condition: cond, then_block: then_b, else_block: else_b }
-            }
-            CS::While { condition, body } => {
-                let cond = Self::build_expr(condition, sem)?;
-                let body_ir = Self::build_stmts(body, sem)?;
-                IrStatement::While { condition: cond, body: body_ir }
-            }
-            CS::For { init, condition, increment, body } => {
-                let init_ir = Box::new(Self::build_stmt(init, sem)?);
-                let cond = Self::build_expr(condition, sem)?;
-                let incr = Self::build_expr(increment, sem)?;
-                let body_ir = Self::build_stmts(body, sem)?;
-                IrStatement::While2 { init: init_ir, condition: cond, increment: incr, body: body_ir }
-            }
-            // ── New statements added for struct / field support ───────────────
-            CS::FieldAssignment { object, field, value } => {
-                let val_ir = Self::build_expr(value, sem)?;
-                IrStatement::Assign {
-                    target: format!("{}.{}", object, field),
-                    value: val_ir,
+                if let Some(alloc) = Self::try_rewrite_alloc(value, sem, struct_fields, fn_param_types) {
+                    return Ok(IrStatement::Assign { target: target.clone(), value: alloc });
                 }
+                IrStatement::Assign { target: target.clone(), value: Self::build_expr(value, sem, struct_fields, fn_param_types)? }
             }
+
+            CS::IndexedAssignment { array, index, value } =>
+                IrStatement::IndexAssign {
+                    array: array.clone(),
+                    index: Self::build_index_expr(index, sem, struct_fields, fn_param_types)?,
+                    value: Self::build_expr(value, sem, struct_fields, fn_param_types)?,
+                },
+
+            CS::FieldAssignment { object, field, value } =>
+                IrStatement::FieldAssign {
+                    object: object.clone(), field: field.clone(),
+                    value: Self::build_expr(value, sem, struct_fields, fn_param_types)?,
+                },
+
+            CS::Return(Some(e)) => IrStatement::Return(Some(Self::build_expr(e, sem, struct_fields, fn_param_types)?)),
+            CS::Return(None)    => IrStatement::Return(None),
+            CS::Break           => IrStatement::Break,
+            CS::Continue        => IrStatement::Continue,
+
+            CS::Expression(e) => {
+                if let CExpression::Call { function, args } = e {
+                    if function == "free" {
+                        if let Some(CExpression::Variable(v)) = args.first() {
+                            return Ok(IrStatement::Drop(v.clone()));
+                        }
+                    }
+                }
+                if let Some(ir) = Self::try_rewrite_io_stmt(e, sem, struct_fields, fn_param_types) {
+                    return Ok(ir);
+                }
+                IrStatement::Expr(Self::build_expr(e, sem, struct_fields, fn_param_types)?)
+            }
+
+            CS::If { condition, then_body, else_body } => IrStatement::If {
+                condition: Self::build_expr(condition, sem, struct_fields, fn_param_types)?,
+                then_block: Self::build_stmts(then_body, sem, struct_fields, fn_param_types)?,
+                else_block: if let Some(eb) = else_body {
+                    Some(Self::build_stmts(eb, sem, struct_fields, fn_param_types)?)
+                } else { None },
+            },
+
+            CS::While { condition, body } => IrStatement::While {
+                condition: Self::build_expr(condition, sem, struct_fields, fn_param_types)?,
+                body: Self::build_stmts(body, sem, struct_fields, fn_param_types)?,
+            },
+
+            CS::For { init, condition, increment, body } => IrStatement::While2 {
+                init: Box::new(Self::build_stmt(init, sem, struct_fields, fn_param_types)?),
+                condition: Self::build_expr(condition, sem, struct_fields, fn_param_types)?,
+                increment: Self::build_expr(increment, sem, struct_fields, fn_param_types)?,
+                body: Self::build_stmts(body, sem, struct_fields, fn_param_types)?,
+            },
+
             CS::StructDecl { name, struct_type, fields } => {
-                // Emit as a let binding; initialiser is a struct-literal expr
-                let init_fields: Vec<(String, IrExpr)> = fields
-                    .iter()
-                    .map(|(fname, fexpr)| {
-                        Self::build_expr(fexpr, sem).map(|e| (fname.clone(), e))
-                    })
-                    .collect::<anyhow::Result<_>>()?;
-                let init = if init_fields.is_empty() {
-                    None
+                let real_names = struct_fields.get(struct_type);
+                let init = if fields.is_empty() {
+                    Some(IrExpr::StructDefault(struct_type.clone()))
                 } else {
-                    Some(IrExpr::StructLiteral {
-                        struct_type: struct_type.clone(),
-                        fields: init_fields,
-                    })
+                    let resolved: Vec<(String, IrExpr)> = fields.iter().enumerate()
+                        .map(|(i, (fname, fexpr))| {
+                            let real = real_names.and_then(|ns| ns.get(i)).cloned().unwrap_or_else(|| fname.clone());
+                            Self::build_expr(fexpr, sem, struct_fields, fn_param_types).map(|e| (real, e))
+                        })
+                        .collect::<anyhow::Result<_>>()?;
+                    Some(IrExpr::StructLiteral { struct_type: struct_type.clone(), fields: resolved })
                 };
-                IrStatement::LetBinding {
-                    name: name.clone(),
-                    rust_type: struct_type.clone(),
-                    init,
-                    is_mutable: true,
-                }
+                IrStatement::LetBinding { name: name.clone(), rust_type: struct_type.clone(), init, is_mutable: true }
             }
         })
     }
 
-    fn build_expr(
-        expr: &ast_input::CExpression,
+    // ── stdio rewriting ──────────────────────────────────────────────────────
+
+    fn try_rewrite_io_stmt(
+        expr: &CExpression,
         sem: &semantic::FunctionSemantics,
-    ) -> anyhow::Result<IrExpr> {
+        struct_fields: &HashMap<String, Vec<String>>,
+        fn_param_types: &HashMap<String, Vec<String>>,
+    ) -> Option<IrStatement> {
         use ast_input::CExpression as CE;
-        use ast_input::CLiteral;
+        if let CE::Call { function, args } = expr {
+            match function.as_str() {
+                "printf" | "fprintf" => {
+                    let (is_err, fmt_idx) = if function == "fprintf" { (true, 1) } else { (false, 0) };
+                    let fmt_arg = args.get(fmt_idx)?;
+                    let (rust_fmt, rest_args) = Self::translate_printf_fmt(fmt_arg, &args[fmt_idx + 1..]);
+                    let ir_args = rest_args.iter()
+                        .map(|a| Self::build_expr(a, sem, struct_fields, fn_param_types))
+                        .collect::<anyhow::Result<Vec<_>>>().ok()?;
+                    let ends_newline = rust_fmt.ends_with('\n');
+                    let ir = if is_err {
+                        IrExpr::EPrintLn { fmt: rust_fmt.trim_end_matches('\n').to_string(), args: ir_args }
+                    } else if ends_newline {
+                        IrExpr::PrintLn { fmt: rust_fmt.trim_end_matches('\n').to_string(), args: ir_args }
+                    } else {
+                        IrExpr::Print { fmt: rust_fmt, args: ir_args }
+                    };
+                    return Some(IrStatement::Expr(ir));
+                }
+                "puts" => {
+                    let s_ir = Self::build_expr(args.first()?, sem, struct_fields, fn_param_types).ok()?;
+                    return Some(IrStatement::Expr(IrExpr::PrintLn { fmt: "{}".to_string(), args: vec![s_ir] }));
+                }
+                "scanf" | "fscanf" => {
+                    let stmts: Vec<IrStatement> = args.iter().skip(1).filter_map(|a| {
+                        if let CE::UnaryOp { op: ast_input::UnaryOp::AddrOf, operand } = a {
+                            if let CE::Variable(v) = operand.as_ref() {
+                                return Some(IrStatement::Expr(IrExpr::ReadLine { var: v.clone() }));
+                            }
+                        }
+                        None
+                    }).collect();
+                    if !stmts.is_empty() {
+                        return Some(stmts.into_iter().next().unwrap());
+                    }
+                }
+                "exit" => {
+                    let code = args.first()
+                        .and_then(|a| Self::build_expr(a, sem, struct_fields, fn_param_types).ok())
+                        .unwrap_or(IrExpr::IntLit(0));
+                    return Some(IrStatement::Expr(IrExpr::Exit(Box::new(code))));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn translate_printf_fmt<'a>(
+        fmt_expr: &'a CExpression,
+        value_args: &'a [CExpression],
+    ) -> (String, &'a [CExpression]) {
+        use ast_input::{CExpression as CE, CLiteral};
+        if let CE::Literal(CLiteral::String(s)) = fmt_expr {
+            let rust = Self::translate_format_specifiers(s);
+            (rust, value_args)
+        } else {
+            ("{:?}".to_string(), value_args)
+        }
+    }
+
+    fn translate_format_specifiers(s: &str) -> String {
+        let mut result = String::new();
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 1 < bytes.len() {
+                i += 1;
+                if bytes[i] == b'%' { result.push('%'); i += 1; continue; }
+                while i < bytes.len() && b"-+ 0#".contains(&bytes[i]) { i += 1; }
+                while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                let mut precision: Option<String> = None;
+                if i < bytes.len() && bytes[i] == b'.' {
+                    i += 1;
+                    let mut prec = String::new();
+                    while i < bytes.len() && bytes[i].is_ascii_digit() { prec.push(bytes[i] as char); i += 1; }
+                    precision = Some(prec);
+                }
+                while i < bytes.len() && b"hlLz".contains(&bytes[i]) { i += 1; }
+                if i < bytes.len() {
+                    let spec = bytes[i] as char;
+                    i += 1;
+                    let fmt = match spec {
+                        'd' | 'i' | 'u' => "{}".to_string(),
+                        'o' => "{:o}".to_string(),
+                        'x' => "{:x}".to_string(),
+                        'X' => "{:X}".to_string(),
+                        'e' => "{:e}".to_string(),
+                        'E' => "{:E}".to_string(),
+                        'g' | 'G' => "{}".to_string(),
+                        'f' | 'F' => {
+                            if let Some(ref p) = precision { format!("{{:.{}}}", p) }
+                            else { "{:.6}".to_string() }
+                        }
+                        'c' | 's' => "{}".to_string(),
+                        'p' => "{:p}".to_string(),
+                        other => format!("{{{}}}", other),
+                    };
+                    result.push_str(&fmt);
+                }
+            } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b'n' => { result.push('\n'); i += 2; }
+                    b't' => { result.push('\t'); i += 2; }
+                    b'r' => { result.push('\r'); i += 2; }
+                    b'\\' => { result.push('\\'); i += 2; }
+                    b'"' => { result.push('"'); i += 2; }
+                    _ => { result.push(bytes[i] as char); i += 1; }
+                }
+            } else {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        result
+    }
+
+    // ── malloc rewriting ──────────────────────────────────────────────────────
+
+    fn try_rewrite_alloc(
+        expr: &CExpression,
+        sem: &semantic::FunctionSemantics,
+        struct_fields: &HashMap<String, Vec<String>>,
+        fn_param_types: &HashMap<String, Vec<String>>,
+    ) -> Option<IrExpr> {
+        use ast_input::CExpression as CE;
+        let (cast_type, inner) = match expr {
+            CE::Cast { to_type, expr: inner } => (Some(to_type.clone()), inner.as_ref()),
+            other => (None, other),
+        };
+        match inner {
+            CE::Call { function, args } => match function.as_str() {
+                "malloc" => {
+                    let elem = cast_type.as_ref().map(|t| Self::pointer_element_type(t)).unwrap_or_else(|| "u8".to_string());
+                    let size = args.first()?;
+                    Some(Self::rewrite_malloc_expr(size, &elem, sem, struct_fields, fn_param_types))
+                }
+                "calloc" => {
+                    let elem = cast_type.as_ref().map(|t| Self::pointer_element_type(t)).unwrap_or_else(|| "u8".to_string());
+                    let count = Self::build_expr(args.first()?, sem, struct_fields, fn_param_types).ok()?;
+                    Some(IrExpr::VecNew { elem_type: elem, len: Box::new(count) })
+                }
+                "realloc" => {
+                    let elem = cast_type.as_ref().map(|t| Self::pointer_element_type(t)).unwrap_or_else(|| "u8".to_string());
+                    let size = args.get(1)?;
+                    Some(Self::rewrite_malloc_expr(size, &elem, sem, struct_fields, fn_param_types))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn rewrite_malloc_expr(
+        size_expr: &CExpression,
+        elem_type: &str,
+        sem: &semantic::FunctionSemantics,
+        struct_fields: &HashMap<String, Vec<String>>,
+        fn_param_types: &HashMap<String, Vec<String>>,
+    ) -> IrExpr {
+        use ast_input::CExpression as CE;
+        if let CE::Call { function, args } = size_expr {
+            if function == "sizeof" {
+                let is_struct = args.first()
+                    .and_then(|a| if let CE::Variable(v) = a { Some(v.as_str()) } else { None })
+                    .map(|t| struct_fields.contains_key(t))
+                    .unwrap_or(false);
+                return if is_struct {
+                    IrExpr::BoxNew(Box::new(IrExpr::StructDefault(elem_type.to_string())))
+                } else {
+                    IrExpr::BoxNew(Box::new(IrExpr::IntLit(0)))
+                };
+            }
+        }
+        if let CE::BinaryOp { left, op: ast_input::BinOp::Mul, right } = size_expr {
+            let (count, _) = if Self::is_sizeof(right) { (left.as_ref(), right.as_ref()) }
+                             else { (right.as_ref(), left.as_ref()) };
+            let count_ir = Self::build_expr(count, sem, struct_fields, fn_param_types).unwrap_or(IrExpr::IntLit(1));
+            return IrExpr::VecNew { elem_type: elem_type.to_string(), len: Box::new(count_ir) };
+        }
+        let count_ir = Self::build_expr(size_expr, sem, struct_fields, fn_param_types).unwrap_or(IrExpr::IntLit(0));
+        IrExpr::VecNew { elem_type: elem_type.to_string(), len: Box::new(count_ir) }
+    }
+
+    fn is_sizeof(expr: &CExpression) -> bool {
+        matches!(expr, CExpression::Call { function, .. } if function == "sizeof")
+    }
+
+    fn pointer_element_type(ctype: &CType) -> String {
+        match ctype {
+            CType::Pointer(inner) => Self::fallback_type(inner),
+            other => Self::fallback_type(other),
+        }
+    }
+
+    // ── Expression builder ────────────────────────────────────────────────────
+
+    fn build_expr(
+        expr: &CExpression,
+        sem: &semantic::FunctionSemantics,
+        struct_fields: &HashMap<String, Vec<String>>,
+        fn_param_types: &HashMap<String, Vec<String>>,
+    ) -> anyhow::Result<IrExpr> {
+        use ast_input::{CExpression as CE, CLiteral};
         Ok(match expr {
             CE::Literal(CLiteral::Int(n))    => IrExpr::IntLit(*n),
             CE::Literal(CLiteral::Float(f))  => IrExpr::FloatLit(*f),
@@ -346,65 +824,143 @@ impl IrBuilder {
             CE::Literal(CLiteral::Char(c))   => IrExpr::CharLit(*c),
             CE::Null                          => IrExpr::NullMut,
             CE::Variable(name)               => IrExpr::Var(name.clone()),
+
             CE::BinaryOp { left, op, right } => IrExpr::BinOp {
-                left: Box::new(Self::build_expr(left, sem)?),
+                left:  Box::new(Self::build_expr(left, sem, struct_fields, fn_param_types)?),
                 op: *op,
-                right: Box::new(Self::build_expr(right, sem)?),
+                right: Box::new(Self::build_expr(right, sem, struct_fields, fn_param_types)?),
             },
+
             CE::UnaryOp { op, operand } => IrExpr::UnaryOp {
                 op: *op,
-                operand: Box::new(Self::build_expr(operand, sem)?),
+                operand: Box::new(Self::build_expr(operand, sem, struct_fields, fn_param_types)?),
             },
-            CE::Call { function, args } => IrExpr::Call {
-                function: function.clone(),
-                args: args.iter().map(|a| Self::build_expr(a, sem)).collect::<anyhow::Result<_>>()?,
-            },
+
+            CE::Call { function, args } => {
+                if let Some(alloc) = Self::try_rewrite_alloc(expr, sem, struct_fields, fn_param_types) {
+                    return Ok(alloc);
+                }
+                match function.as_str() {
+                    "sizeof" => {
+                        if let Some(CE::Variable(t)) = args.first() {
+                            return Ok(IrExpr::Call {
+                                function: format!("std::mem::size_of::<{}>", Self::c_name_to_rust(t)),
+                                args: vec![],
+                            });
+                        }
+                    }
+                    "printf" | "fprintf" | "puts" => {
+                        if let Some(IrStatement::Expr(e)) = Self::try_rewrite_io_stmt(expr, sem, struct_fields, fn_param_types) {
+                            return Ok(e);
+                        }
+                    }
+                    "exit" => {
+                        let code = args.first()
+                            .and_then(|a| Self::build_expr(a, sem, struct_fields, fn_param_types).ok())
+                            .unwrap_or(IrExpr::IntLit(0));
+                        return Ok(IrExpr::Exit(Box::new(code)));
+                    }
+                    _ => {}
+                }
+                let rust_fn = Self::map_stdlib_fn(function);
+                let built_args: Vec<IrExpr> = args.iter()
+                    .map(|a| Self::build_expr(a, sem, struct_fields, fn_param_types))
+                    .collect::<anyhow::Result<_>>()?;
+
+                // Coerce arguments at call sites
+                let coerced_args = if let Some(param_types) = fn_param_types.get(function.as_str()) {
+                    built_args.into_iter().enumerate().map(|(i, arg)| {
+                        if let Some(param_type) = param_types.get(i) {
+                            Self::coerce_arg(arg, param_type, sem)
+                        } else { arg }
+                    }).collect()
+                } else { built_args };
+
+                IrExpr::Call { function: rust_fn, args: coerced_args }
+            }
+
             CE::ArrayAccess { array, index } => IrExpr::ArrayAccess {
-                array: Box::new(Self::build_expr(array, sem)?),
-                index: Box::new(Self::build_index_expr(index, sem)?),
+                array: Box::new(Self::build_expr(array, sem, struct_fields, fn_param_types)?),
+                index: Box::new(Self::build_index_expr(index, sem, struct_fields, fn_param_types)?),
             },
+
             CE::ArrayLiteral(elems) => IrExpr::ArrayLiteral(
-                elems.iter().map(|e| Self::build_expr(e, sem)).collect::<anyhow::Result<_>>()?
+                elems.iter().map(|e| Self::build_expr(e, sem, struct_fields, fn_param_types)).collect::<anyhow::Result<_>>()?
             ),
+
             CE::Cast { to_type, expr: inner } => {
                 let rust_type = Self::fallback_type(to_type);
-                IrExpr::Cast { to_type: rust_type, expr: Box::new(Self::build_expr(inner, sem)?) }
+                IrExpr::Cast { to_type: rust_type, expr: Box::new(Self::build_expr(inner, sem, struct_fields, fn_param_types)?) }
             }
+
             CE::FieldAccess { object, field } => {
-                IrExpr::FieldAccess {
-                    object: Box::new(Self::build_expr(object, sem)?),
-                    field: field.clone(),
+                let obj_ir = Self::build_expr(object, sem, struct_fields, fn_param_types)?;
+                let needs_deref = match object.as_ref() {
+                    CE::Variable(name) => sem.symbol_table.c_type(name)
+                        .map(|t| matches!(t, CType::Pointer(_))).unwrap_or(false),
+                    _ => false,
+                };
+                if needs_deref {
+                    IrExpr::FieldAccess { object: Box::new(IrExpr::Deref(Box::new(obj_ir))), field: field.clone() }
+                } else {
+                    IrExpr::FieldAccess { object: Box::new(obj_ir), field: field.clone() }
                 }
             }
+
             CE::StructLiteral { struct_type, fields } => {
-                let ir_fields: Vec<(String, IrExpr)> = fields
-                    .iter()
-                    .map(|(name, expr)| Self::build_expr(expr, sem).map(|e| (name.clone(), e)))
+                let real_names = struct_fields.get(struct_type);
+                let resolved = fields.iter().enumerate()
+                    .map(|(i, (fname, fexpr))| {
+                        let real = real_names.and_then(|ns| ns.get(i)).cloned().unwrap_or_else(|| fname.clone());
+                        Self::build_expr(fexpr, sem, struct_fields, fn_param_types).map(|e| (real, e))
+                    })
                     .collect::<anyhow::Result<_>>()?;
-                IrExpr::StructLiteral { struct_type: struct_type.clone(), fields: ir_fields }
+                IrExpr::StructLiteral { struct_type: struct_type.clone(), fields: resolved }
             }
         })
     }
 
     fn build_index_expr(
-        expr: &ast_input::CExpression,
+        expr: &CExpression,
         sem: &semantic::FunctionSemantics,
+        struct_fields: &HashMap<String, Vec<String>>,
+        fn_param_types: &HashMap<String, Vec<String>>,
     ) -> anyhow::Result<IrExpr> {
-        use ast_input::CExpression as CE;
-        use ast_input::CLiteral;
-        // Plain integer literal → no cast needed
+        use ast_input::{CExpression as CE, CLiteral};
         if let CE::Literal(CLiteral::Int(_)) = expr {
-            return Self::build_expr(expr, sem);
+            return Self::build_expr(expr, sem, struct_fields, fn_param_types);
         }
-        Ok(IrExpr::AsUsize(Box::new(Self::build_expr(expr, sem)?)))
+        Ok(IrExpr::AsUsize(Box::new(Self::build_expr(expr, sem, struct_fields, fn_param_types)?)))
     }
 
-    fn fallback_type(ctype: &CType) -> String {
+    fn map_stdlib_fn(name: &str) -> String {
+        match name {
+            "abs"   => "i32::abs".to_string(),
+            "fabs"  => "f64::abs".to_string(),
+            "sqrt"  => "f64::sqrt".to_string(),
+            "pow"   => "f64::powi".to_string(),
+            "floor" => "f64::floor".to_string(),
+            "ceil"  => "f64::ceil".to_string(),
+            "rand"  => "rand::random::<i32>".to_string(),
+            "atoi"  => "str::parse::<i32>".to_string(),
+            "atof"  => "str::parse::<f64>".to_string(),
+            other   => other.to_string(),
+        }
+    }
+
+    fn c_name_to_rust(name: &str) -> &str {
+        match name {
+            "int" => "i32", "char" => "u8", "float" => "f32",
+            "double" => "f64", "long" => "i64", other => other,
+        }
+    }
+
+    pub fn fallback_type(ctype: &CType) -> String {
         match ctype {
-            CType::Void   => "()".to_string(),
+            CType::Void   => "()" .to_string(),
             CType::Int    => "i32".to_string(),
-            CType::Char   => "u8".to_string(),
-            CType::UChar  => "u8".to_string(),
+            CType::Char   => "u8" .to_string(),
+            CType::UChar  => "u8" .to_string(),
             CType::Short  => "i16".to_string(),
             CType::Long   => "i64".to_string(),
             CType::UInt   => "u32".to_string(),
@@ -418,5 +974,47 @@ impl IrBuilder {
             CType::Struct(name)          => name.clone(),
             CType::Unknown(s)            => s.clone(),
         }
+    }
+
+    /// Coerce a call-site argument to match the expected parameter type.
+    fn coerce_arg(arg: IrExpr, param_type: &str, _sem: &semantic::FunctionSemantics) -> IrExpr {
+        // &mut [T] param: pass fixed array as &mut arr (auto-coercion) or slice ref
+        if param_type.starts_with("&mut [") {
+            match &arg {
+                IrExpr::Var(_) => return IrExpr::RefMut(Box::new(arg)),
+                IrExpr::ArrayAccess { .. } => return arg, // already indexing
+                _ => {}
+            }
+        }
+        // Vec<T> param: array → .to_vec()
+        if param_type.starts_with("Vec<") {
+            if let IrExpr::Var(_) = &arg {
+                return IrExpr::Call { function: "__to_vec__".to_string(), args: vec![arg] };
+            }
+        }
+        // Integer → float coercions
+        match &arg {
+            IrExpr::IntLit(n) if param_type == "f32" => return IrExpr::FloatLit(*n as f64),
+            IrExpr::IntLit(n) if param_type == "f64" => return IrExpr::FloatLit(*n as f64),
+            IrExpr::Var(_) if param_type == "f32" =>
+                return IrExpr::Cast { to_type: "f32".to_string(), expr: Box::new(arg) },
+            IrExpr::Var(_) if param_type == "f64" =>
+                return IrExpr::Cast { to_type: "f64".to_string(), expr: Box::new(arg) },
+            _ => {}
+        }
+        arg
+    }
+}
+
+/// Simple structural equality for IR expressions (used in swap detection).
+fn expr_eq(a: &IrExpr, b: &IrExpr) -> bool {
+    match (a, b) {
+        (IrExpr::IntLit(x), IrExpr::IntLit(y)) => x == y,
+        (IrExpr::Var(x), IrExpr::Var(y)) => x == y,
+        (IrExpr::AsUsize(x), IrExpr::AsUsize(y)) => expr_eq(x, y),
+        (IrExpr::BinOp { left: l1, op: o1, right: r1 }, IrExpr::BinOp { left: l2, op: o2, right: r2 }) => {
+            format!("{:?}", o1) == format!("{:?}", o2) && expr_eq(l1, l2) && expr_eq(r1, r2)
+        }
+        _ => false,
     }
 }

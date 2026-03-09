@@ -36,7 +36,7 @@ pub struct MemoryPattern {
 pub struct MemoryPatternAnalyser;
 
 impl MemoryPatternAnalyser {
-    pub fn analyse(func: &CFunction, table: &SymbolTable) -> Vec<MemoryPattern> {
+    pub fn analyse(func: &CFunction, _table: &SymbolTable) -> Vec<MemoryPattern> {
         let mut patterns = Vec::new();
 
         // Parameters

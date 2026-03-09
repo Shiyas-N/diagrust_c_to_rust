@@ -59,6 +59,13 @@ impl TypeMapper {
                 CStatement::While { body, .. } | CStatement::For { body, .. } => {
                     Self::map_stmts(body, ownership_map, map);
                 }
+                CStatement::StructDecl { name, struct_type, .. } => {
+                    map.insert(name.clone(), RustType {
+                        rust_repr: struct_type.clone(),
+                        requires_unsafe: false,
+                        is_idiomatic: true,
+                    });
+                }
                 _ => {}
             }
         }

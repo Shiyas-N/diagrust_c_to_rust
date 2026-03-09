@@ -1,5 +1,7 @@
 // ast_input/src/lib.rs
 //
+#![allow(non_upper_case_globals)]
+//
 // Clang-AST based C parser.
 // Replaces the old regex / hand-rolled parser.  Uses clang-sys (libclang
 // bindings) to obtain a proper AST and walks it into our internal CProgram
@@ -27,11 +29,24 @@ pub enum ValidationError {
 // AST types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A top-level (global) variable declaration.
+#[derive(Debug, Clone)]
+pub struct CGlobalVar {
+    pub name: String,
+    pub var_type: CType,
+    pub init: Option<CExpression>,
+    pub is_const: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CProgram {
     pub functions: Vec<CFunction>,
-    /// Top-level struct type definitions collected from the translation unit.
+    /// Top-level struct type definitions.
     pub structs: Vec<CStructDef>,
+    /// Top-level variable declarations (globals / consts).
+    pub global_vars: Vec<CGlobalVar>,
+    /// True if a `main` function was found — executable program.
+    pub has_main: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -251,7 +266,7 @@ impl ClangParser {
                 anyhow::bail!("libclang failed to parse the translation unit");
             }
 
-            let mut program = CProgram { functions: Vec::new(), structs: Vec::new() };
+            let mut program = CProgram { functions: Vec::new(), structs: Vec::new(), global_vars: Vec::new(), has_main: false };
             let root = clang_getTranslationUnitCursor(tu);
 
             extern "C" fn top_visitor(
@@ -267,6 +282,7 @@ impl ClangParser {
             clang_visitChildren(root, top_visitor, &mut program as *mut _ as CXClientData);
             clang_disposeTranslationUnit(tu);
             clang_disposeIndex(index);
+            program.has_main = program.functions.iter().any(|f| f.name == "main");
             Ok(program)
         }
     }
@@ -281,6 +297,14 @@ pub type SimpleParser = ClangParser;
 
 unsafe fn visit_top_level(cursor: clang_sys::CXCursor, prog: &mut CProgram) {
     use clang_sys::*;
+
+    // Skip anything that comes from an #include'd file (stdio.h, stdlib.h, etc.)
+    // Only process declarations physically located in the user's own source file.
+    let loc = clang_getCursorLocation(cursor);
+    if clang_Location_isFromMainFile(loc) == 0 {
+        return;
+    }
+
     match clang_getCursorKind(cursor) {
         CXCursor_StructDecl => {
             if let Some(sd) = extract_struct_def(cursor) {
@@ -293,6 +317,16 @@ unsafe fn visit_top_level(cursor: clang_sys::CXCursor, prog: &mut CProgram) {
                     prog.functions.push(f);
                 }
             }
+        }
+        CXCursor_VarDecl => {
+            // Top-level global variable
+            let name      = cursor_spelling(cursor);
+            let var_type  = cx_type_to_ctype(clang_getCursorType(cursor));
+            let type_str  = type_spelling(clang_getCursorType(cursor));
+            let is_const  = type_str.contains("const");
+            let children  = collect_children(cursor);
+            let init = children.iter().find_map(|&c| extract_expr(c));
+            prog.global_vars.push(CGlobalVar { name, var_type, init, is_const });
         }
         _ => {}
     }
@@ -749,6 +783,9 @@ unsafe fn binary_op_from_tokens(cursor: clang_sys::CXCursor) -> BinOp {
                     ")" => { paren_depth   -= 1; continue; }
                     "[" => { bracket_depth += 1; continue; }
                     "]" => { bracket_depth -= 1; continue; }
+                    // "." is a member access — not a binary operator, skip it
+                    // "->" is also member access (pointer), skip
+                    "." | "->" => { continue; }
                     _ => {}
                 }
                 if seen_left && paren_depth == 0 && bracket_depth == 0 {

@@ -77,7 +77,7 @@ pub struct OwnershipInferrer;
 
 impl OwnershipInferrer {
     pub fn infer(
-        func: &CFunction,
+        _func: &CFunction,
         alias_graph: &AliasGraph,
         memory_patterns: &[MemoryPattern],
     ) -> HashMap<String, OwnershipKind> {

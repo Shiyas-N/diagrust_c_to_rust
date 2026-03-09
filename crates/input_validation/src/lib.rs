@@ -266,6 +266,7 @@ impl InputValidator {
             ("[", "arrays"),
             ("struct", "structs"),
             ("malloc", "dynamic allocation"),
+            ("main", "entry point (executable)"),
             ("free", "deallocation"),
             ("for", "for loops"),
             ("while", "while loops"),
@@ -291,7 +292,7 @@ impl InputValidator {
             ("asm", "inline assembly"),
             ("__asm__", "inline assembly"),
             ("union", "union types"),
-            ("typedef", "typedef declarations"),
+            // typedef: handled by libclang AST — no longer blocked
             ("extern", "extern declarations"),
             ("__attribute__", "GCC attributes"),
             ("longjmp", "longjmp/setjmp"),

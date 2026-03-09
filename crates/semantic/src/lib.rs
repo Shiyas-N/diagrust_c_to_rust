@@ -64,6 +64,28 @@ pub struct FunctionSemantics {
     pub mutable_vars: HashSet<String>,
 }
 
+impl FunctionSemantics {
+    /// Create an empty FunctionSemantics for contexts where no analysis is available
+    /// (e.g. evaluating global variable initialisers).
+    pub fn empty() -> Self {
+        use ast_input::CType;
+        Self {
+            name: String::new(),
+            return_type: CType::Void,
+            parameters: vec![],
+            symbol_table: crate::symbol_table::SymbolTable::default(),
+            def_use_chains: Default::default(),
+            alias_graph: crate::alias::AliasGraph::default(),
+            memory_patterns: vec![],
+            ownership_map: Default::default(),
+            lifetime_map: Default::default(),
+            rust_type_map: Default::default(),
+            cfg: crate::cfg::ControlFlowGraph::default(),
+            mutable_vars: Default::default(),
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SemanticAnalyser – orchestrates all sub-analysers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -143,6 +165,7 @@ impl MutabilityAnalyser {
         match stmt {
             CStatement::Assignment { target, .. } => { set.insert(target.clone()); }
             CStatement::IndexedAssignment { array, .. } => { set.insert(array.clone()); }
+            CStatement::FieldAssignment { object, .. } => { set.insert(object.clone()); }
             CStatement::If { then_body, else_body, .. } => {
                 for s in then_body { Self::from_statement(s, set); }
                 if let Some(eb) = else_body { for s in eb { Self::from_statement(s, set); } }

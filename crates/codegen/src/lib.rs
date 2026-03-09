@@ -354,8 +354,12 @@ impl ExprEmitter {
             IrExpr::OptionSome(i) => format!("Some({})", Self::emit(i)?),
             IrExpr::Var(name)    => name.clone(),
 
-            IrExpr::BinOp { left, op, right } =>
-                format!("{} {} {}", Self::emit(left)?, binop_str(op), Self::emit(right)?),
+            IrExpr::BinOp { left, op, right } => {
+                let op_prec  = binop_precedence(op);
+                let left_s   = Self::emit_with_parens(left,  op_prec, false)?;
+                let right_s  = Self::emit_with_parens(right, op_prec, true)?;
+                format!("{} {} {}", left_s, binop_str(op), right_s)
+            }
 
             IrExpr::UnaryOp { op, operand } =>
                 format!("{}{}", unaryop_str(op), Self::emit(operand)?),
@@ -441,6 +445,26 @@ impl ExprEmitter {
             IrExpr::Exit(code) => format!("std::process::exit({})", Self::emit(code)?),
         })
     }
+    /// Emit an expression, wrapping it in parentheses if its own precedence is
+    /// lower than `parent_prec` (meaning it would bind looser than the parent
+    /// operator and would be incorrectly associated without parens).
+    ///
+    /// `is_right` handles right-associativity: for left-associative operators
+    /// (all the common arithmetic ones) the right operand needs parens even when
+    /// equal precedence, because `a - (b - c) ≠ a - b - c`.
+    fn emit_with_parens(expr: &IrExpr, parent_prec: u8, is_right: bool) -> anyhow::Result<String> {
+        let s = Self::emit(expr)?;
+        let needs_parens = match expr {
+            IrExpr::BinOp { op, .. } => {
+                let child_prec = binop_precedence(op);
+                child_prec < parent_prec
+                    || (is_right && child_prec == parent_prec
+                        && !matches!(op, BinOp::Assign))
+            }
+            _ => false,
+        };
+        if needs_parens { Ok(format!("({})", s)) } else { Ok(s) }
+    }
 }
 
 fn primitive_default(t: &str) -> &str {
@@ -472,5 +496,24 @@ fn unaryop_str(op: &UnaryOp) -> &'static str {
         UnaryOp::Deref  => "*",
         UnaryOp::AddrOf => "&",
         UnaryOp::BitNot => "!",
+    }
+}
+
+/// Operator precedence — higher number = binds tighter.
+/// Mirrors C/Rust precedence exactly.
+fn binop_precedence(op: &BinOp) -> u8 {
+    match op {
+        BinOp::Assign                        => 1,
+        BinOp::Or                            => 2,
+        BinOp::And                           => 3,
+        BinOp::BitOr                         => 4,
+        BinOp::BitXor                        => 5,
+        BinOp::BitAnd                        => 6,
+        BinOp::Equal | BinOp::NotEqual       => 7,
+        BinOp::Less  | BinOp::LessEq
+            | BinOp::Greater | BinOp::GreaterEq => 8,
+        BinOp::Shl   | BinOp::Shr           => 9,
+        BinOp::Add   | BinOp::Sub           => 10,
+        BinOp::Mul   | BinOp::Div | BinOp::Mod => 11,
     }
 }

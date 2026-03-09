@@ -790,45 +790,56 @@ unsafe fn extract_binary(cursor: clang_sys::CXCursor) -> Option<CExpression> {
 
 unsafe fn binary_op_from_tokens(cursor: clang_sys::CXCursor) -> BinOp {
     use clang_sys::*;
+
+    let ch = collect_children(cursor);
+    if ch.len() < 2 { return BinOp::Add; }
+
     let tu = clang_Cursor_getTranslationUnit(cursor);
-    let range = clang_getCursorExtent(cursor);
+
+    // The operator token lives in the gap between the left child's range end
+    // and the right child's range start.  Scanning from the left always finds
+    // the wrong (first) operator in expressions like `3 + 6 * (5+4) / 3 - 7`
+    // where the outer node is `-` but `+` appears earlier in the token stream.
+    let left_range  = clang_getCursorExtent(ch[0]);
+    let right_range = clang_getCursorExtent(ch[1]);
+
+    let left_end   = clang_getRangeEnd(left_range);
+    let right_start = clang_getRangeStart(right_range);
+
+    let mut left_offset  = 0u32;
+    let mut right_offset = 0u32;
+    let mut file: CXFile = std::ptr::null_mut();
+
+    clang_getSpellingLocation(left_end,   &mut file, std::ptr::null_mut(), std::ptr::null_mut(), &mut left_offset);
+    clang_getSpellingLocation(right_start, &mut file, std::ptr::null_mut(), std::ptr::null_mut(), &mut right_offset);
+
+    // Tokenize the full parent range and look for the first punctuation token
+    // whose offset is strictly after left_offset and before right_offset.
+    let full_range = clang_getCursorExtent(cursor);
     let mut toks: *mut CXToken = std::ptr::null_mut();
     let mut n: u32 = 0;
-    clang_tokenize(tu, range, &mut toks, &mut n);
+    clang_tokenize(tu, full_range, &mut toks, &mut n);
     if toks.is_null() || n == 0 { return BinOp::Add; }
 
     let tokens = std::slice::from_raw_parts(toks, n as usize);
     let mut op = BinOp::Add;
-    let mut seen_left = false;
-    let mut paren_depth   = 0i32;  // tracks ( )
-    let mut bracket_depth = 0i32;  // tracks [ ]
 
     for tok in tokens {
-        let k = clang_getTokenKind(*tok);
-        let sp = cx_string(clang_getTokenSpelling(tu, *tok));
-        match k {
-            CXToken_Punctuation => {
-                match sp.as_str() {
-                    "(" => { paren_depth   += 1; continue; }
-                    ")" => { paren_depth   -= 1; continue; }
-                    "[" => { bracket_depth += 1; continue; }
-                    "]" => { bracket_depth -= 1; continue; }
-                    // "." is a member access — not a binary operator, skip it
-                    // "->" is also member access (pointer), skip
-                    "." | "->" => { continue; }
-                    _ => {}
-                }
-                if seen_left && paren_depth == 0 && bracket_depth == 0 {
-                    op = str_to_binop(&sp);
-                    break;
-                }
+        if clang_getTokenKind(*tok) != CXToken_Punctuation { continue; }
+
+        let tok_loc = clang_getTokenLocation(tu, *tok);
+        let mut tok_offset = 0u32;
+        clang_getSpellingLocation(tok_loc, &mut file, std::ptr::null_mut(), std::ptr::null_mut(), &mut tok_offset);
+
+        if tok_offset > left_offset && tok_offset < right_offset {
+            let sp = cx_string(clang_getTokenSpelling(tu, *tok));
+            // Skip structural punctuation that is never a binary operator
+            match sp.as_str() {
+                "(" | ")" | "[" | "]" | "." | "->" | ";" | "{" | "}" => continue,
+                _ => {}
             }
-            CXToken_Identifier | CXToken_Literal => {
-                if paren_depth == 0 && bracket_depth == 0 {
-                    seen_left = true;
-                }
-            }
-            _ => {}
+            op = str_to_binop(&sp);
+            break;
         }
     }
 

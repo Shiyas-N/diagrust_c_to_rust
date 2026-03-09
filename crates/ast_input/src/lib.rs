@@ -685,8 +685,22 @@ unsafe fn extract_stmt_expr(cursor: clang_sys::CXCursor) -> Option<CStatement> {
                 }
             }
             CExpression::FieldAccess { object, field } => {
-                if let CExpression::Variable(obj) = *object {
-                    return Some(CStatement::FieldAssignment { object: obj, field, value: *right });
+                // Flatten possibly-nested field access into a dot-path string.
+                // e.g. rect.top_left = ... → object="rect", field="top_left"  (simple)
+                //      rect.top_left.x = ... → object="rect.top_left", field="x" (nested)
+                fn field_path(expr: CExpression) -> Option<String> {
+                    match expr {
+                        CExpression::Variable(v) => Some(v),
+                        CExpression::FieldAccess { object, field } => {
+                            Some(format!("{}.{}", field_path(*object)?, field))
+                        }
+                        _ => None,
+                    }
+                }
+                if let Some(obj_path) = field_path(*object) {
+                    return Some(CStatement::FieldAssignment {
+                        object: obj_path, field, value: *right,
+                    });
                 }
             }
             _ => {}

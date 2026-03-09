@@ -167,7 +167,6 @@ impl FunctionTranslator {
             out.push('(');
             for (i, param) in func.parameters.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                // Slice params (&mut [T]) don't need extra `mut` prefix on the binding
                 if param.is_mutable && !param.rust_type.starts_with("&mut") {
                     out.push_str("mut ");
                 }
@@ -183,8 +182,12 @@ impl FunctionTranslator {
             out.push_str(" {\n");
         }
 
+        // The IR's wrap_global_accesses wraps the entire function body in a
+        // single UnsafeBlock when globals are accessed.  The requires_unsafe
+        // flag is set in that case.  We emit that block directly (which adds
+        // the `unsafe { }` wrapper) rather than adding a second one here.
         for stmt in &func.body {
-            out.push_str(&Self::emit_stmt(stmt, 1, func.requires_unsafe)?);
+            out.push_str(&Self::emit_stmt(stmt, 1, false)?);
         }
 
         out.push('}');
@@ -250,6 +253,23 @@ impl FunctionTranslator {
             }
 
             IrStatement::Drop(var) => format!("{}drop({});\n", ind, var),
+
+            IrStatement::Scanf { vars } => {
+                // Emit one typed stdin-read block per variable.
+                // Each variable must already be declared (let mut var: T) in scope.
+                let mut s = String::new();
+                for var in vars {
+                    s.push_str(&format!(
+                        "{ind}{{\n\
+                         {ind}    let mut _buf = String::new();\n\
+                         {ind}    io::stdin().read_line(&mut _buf).expect(\"Failed to read input\");\n\
+                         {ind}    {var} = _buf.trim().parse().unwrap_or_default();\n\
+                         {ind}}}\n",
+                        ind = ind, var = var
+                    ));
+                }
+                s
+            }
 
             IrStatement::If { condition, then_block, else_block } => {
                 let mut s = format!("{}if {} {{\n", ind, ExprEmitter::emit(condition)?);
@@ -319,11 +339,17 @@ fn emit_print_macro_str(mac: &str, fmt: &str, args: &[IrExpr]) -> anyhow::Result
 }
 
 fn emit_read_line(ind: &str, var: &str) -> String {
+    // Emit a typed stdin read. The variable is already declared in the
+    // surrounding scope by the LetBinding for it, so we just assign here.
+    // We use a fresh buffer each time to avoid borrow issues.
     format!(
-        "{ind}let mut _input_buf = String::new();\n\
-         {ind}io::stdin().read_line(&mut _input_buf).expect(\"Failed to read input\");\n\
-         {ind}let {var} = _input_buf.trim().parse().unwrap_or_default();\n",
-        ind = ind, var = var
+        "{ind}{{\n\
+         {ind}    let mut _buf = String::new();\n\
+         {ind}    io::stdin().read_line(&mut _buf).expect(\"Failed to read input\");\n\
+         {ind}    {var} = _buf.trim().parse().unwrap_or_default();\n\
+         {ind}}}\n",
+        ind = ind,
+        var = var
     )
 }
 

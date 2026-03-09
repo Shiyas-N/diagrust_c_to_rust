@@ -65,6 +65,8 @@ pub enum IrStatement {
     Drop(String),
     /// Swap two array elements in-place: arr.swap(i, j)
     SwapElements { array: String, i: IrExpr, j: IrExpr },
+    /// Read one or more values from stdin (from C scanf)
+    Scanf { vars: Vec<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -302,7 +304,7 @@ impl IrBuilder {
 
         // Wrap global accesses: hoist let-bindings outside unsafe blocks
         let (body, needs_unsafe_for_globals) = if !global_names.is_empty() {
-            Self::wrap_global_accesses(raw_body, global_names, requires_unsafe)
+            Self::detect_global_accesses(raw_body, global_names)
         } else {
             (raw_body, false)
         };
@@ -393,70 +395,42 @@ impl IrBuilder {
         }
     }
 
-    /// Wrap statements that touch global (static mut) variables in unsafe blocks.
-    /// Hoists LetBinding declarations outside the unsafe block to prevent scope errors.
-    /// When `already_unsafe` is true, no wrapper is emitted (prevents nesting).
-    fn wrap_global_accesses(
+    /// Scan statements for any access to global (static mut) variables.
+    /// Returns the statements unchanged and a bool for `requires_unsafe`.
+    /// The actual `unsafe {}` wrapper is emitted by FunctionTranslator as a
+    /// single block around the entire function body, keeping all `let` bindings
+    /// in scope and avoiding split-block scope errors.
+    fn detect_global_accesses(
         stmts: Vec<IrStatement>,
         globals: &HashSet<String>,
-        already_unsafe: bool,
     ) -> (Vec<IrStatement>, bool) {
-        if globals.is_empty() { return (stmts, false); }
-        let mut out = Vec::new();
-        let mut wrapped = false;
-        let mut unsafe_buf: Vec<IrStatement> = Vec::new();
-        // Hoisted declarations that need to live outside unsafe
-        let mut hoisted: Vec<IrStatement> = Vec::new();
+        let touched = Self::any_stmt_touches_globals(&stmts, globals);
+        (stmts, touched)
+    }
 
-        for stmt in stmts {
-            if Self::stmt_touches_globals(&stmt, globals) {
-                wrapped = true;
-                // Hoist LetBinding declarations outside the unsafe block
-                if let IrStatement::LetBinding { name, rust_type, init: Some(_), is_mutable } = &stmt {
-                    // Split: hoist uninitialized binding, keep init assignment inside unsafe
-                    let hoisted_decl = IrStatement::LetBinding {
-                        name: name.clone(),
-                        rust_type: rust_type.clone(),
-                        init: None,
-                        is_mutable: *is_mutable,
-                    };
-                    if !already_unsafe {
-                        if !unsafe_buf.is_empty() {
-                            out.extend(hoisted.drain(..));
-                            out.push(IrStatement::UnsafeBlock(std::mem::take(&mut unsafe_buf)));
-                        }
-                        out.push(hoisted_decl);
-                        // Put the assignment inside unsafe
-                        if let IrStatement::LetBinding { name, init: Some(init_expr), .. } = stmt {
-                            unsafe_buf.push(IrStatement::Assign { target: name, value: init_expr });
-                        }
-                    } else {
-                        unsafe_buf.push(stmt);
-                    }
-                } else {
-                    unsafe_buf.push(stmt);
-                }
-            } else {
-                if !unsafe_buf.is_empty() {
-                    out.extend(hoisted.drain(..));
-                    if already_unsafe {
-                        out.extend(std::mem::take(&mut unsafe_buf));
-                    } else {
-                        out.push(IrStatement::UnsafeBlock(std::mem::take(&mut unsafe_buf)));
-                    }
-                }
-                out.push(stmt);
-            }
+    /// Recursively check whether any statement in the list (or nested blocks)
+    /// touches a global variable.
+    fn any_stmt_touches_globals(stmts: &[IrStatement], globals: &HashSet<String>) -> bool {
+        stmts.iter().any(|s| Self::stmt_touches_globals_deep(s, globals))
+    }
+
+    fn stmt_touches_globals_deep(stmt: &IrStatement, globals: &HashSet<String>) -> bool {
+        match stmt {
+            IrStatement::UnsafeBlock(inner) =>
+                Self::any_stmt_touches_globals(inner, globals),
+            IrStatement::If { condition, then_block, else_block } =>
+                Self::expr_touches_globals(condition, globals)
+                || Self::any_stmt_touches_globals(then_block, globals)
+                || else_block.as_deref().map_or(false, |b| Self::any_stmt_touches_globals(b, globals)),
+            IrStatement::While { condition, body } =>
+                Self::expr_touches_globals(condition, globals)
+                || Self::any_stmt_touches_globals(body, globals),
+            IrStatement::While2 { condition, increment, body, .. } =>
+                Self::expr_touches_globals(condition, globals)
+                || Self::expr_touches_globals(increment, globals)
+                || Self::any_stmt_touches_globals(body, globals),
+            other => Self::stmt_touches_globals(other, globals),
         }
-        if !unsafe_buf.is_empty() {
-            out.extend(hoisted.drain(..));
-            if already_unsafe {
-                out.extend(unsafe_buf);
-            } else {
-                out.push(IrStatement::UnsafeBlock(unsafe_buf));
-            }
-        }
-        (out, wrapped)
     }
 
     fn stmt_touches_globals(stmt: &IrStatement, globals: &HashSet<String>) -> bool {
@@ -521,8 +495,13 @@ impl IrBuilder {
                     .unwrap_or_else(|| Self::fallback_type(var_type));
                 let is_mutable = sem.mutable_vars.contains(name) || init.is_none();
                 let init_ir = match init {
-                    Some(e) => Some(Self::build_expr(e, sem, struct_fields, fn_param_types)?),
-                    None    => None,
+                    Some(e) => {
+                        let expr = Self::build_expr(e, sem, struct_fields, fn_param_types)?;
+                        // Coerce integer literals to float when the declared type is f32/f64
+                        let expr = Self::coerce_to_type(expr, &rust_type);
+                        Some(expr)
+                    }
+                    None => None,
                 };
                 IrStatement::LetBinding { name: name.clone(), rust_type, init: init_ir, is_mutable }
             }
@@ -645,16 +624,16 @@ impl IrBuilder {
                     return Some(IrStatement::Expr(IrExpr::PrintLn { fmt: "{}".to_string(), args: vec![s_ir] }));
                 }
                 "scanf" | "fscanf" => {
-                    let stmts: Vec<IrStatement> = args.iter().skip(1).filter_map(|a| {
+                    let vars: Vec<String> = args.iter().skip(1).filter_map(|a| {
                         if let CE::UnaryOp { op: ast_input::UnaryOp::AddrOf, operand } = a {
                             if let CE::Variable(v) = operand.as_ref() {
-                                return Some(IrStatement::Expr(IrExpr::ReadLine { var: v.clone() }));
+                                return Some(v.clone());
                             }
                         }
                         None
                     }).collect();
-                    if !stmts.is_empty() {
-                        return Some(stmts.into_iter().next().unwrap());
+                    if !vars.is_empty() {
+                        return Some(IrStatement::Scanf { vars });
                     }
                 }
                 "exit" => {
@@ -833,11 +812,22 @@ impl IrBuilder {
             CE::Null                          => IrExpr::NullMut,
             CE::Variable(name)               => IrExpr::Var(name.clone()),
 
-            CE::BinaryOp { left, op, right } => IrExpr::BinOp {
-                left:  Box::new(Self::build_expr(left, sem, struct_fields, fn_param_types)?),
-                op: *op,
-                right: Box::new(Self::build_expr(right, sem, struct_fields, fn_param_types)?),
-            },
+            CE::BinaryOp { left, op, right } => {
+                let left_ir  = Self::build_expr(left,  sem, struct_fields, fn_param_types)?;
+                let right_ir = Self::build_expr(right, sem, struct_fields, fn_param_types)?;
+                // Resolve types for Var nodes via the semantic type map.
+                let left_ty  = Self::infer_expr_type(&left_ir,  sem);
+                let right_ty = Self::infer_expr_type(&right_ir, sem);
+                // Promote integer operand to float when the other side is float.
+                let (left_ir, right_ir) = Self::coerce_numeric_pair(
+                    left_ir, right_ir, left_ty.as_deref(), right_ty.as_deref()
+                );
+                IrExpr::BinOp {
+                    left:  Box::new(left_ir),
+                    op: *op,
+                    right: Box::new(right_ir),
+                }
+            }
 
             CE::UnaryOp { op, operand } => IrExpr::UnaryOp {
                 op: *op,
@@ -984,7 +974,99 @@ impl IrBuilder {
         }
     }
 
-    /// Coerce a call-site argument to match the expected parameter type.
+    /// Coerce an expression to match a target Rust type when they're known to differ.
+    fn coerce_to_type(expr: IrExpr, rust_type: &str) -> IrExpr {
+        match (&expr, rust_type) {
+            (IrExpr::IntLit(n), "f32") => IrExpr::FloatLit(*n as f64),
+            (IrExpr::IntLit(n), "f64") => IrExpr::FloatLit(*n as f64),
+            _ => expr,
+        }
+    }
+
+    /// When one operand of a binary expression is a float and the other is an
+    /// integer literal, promote the integer to a float literal so Rust is happy.
+    /// When one is a float variable/expr and the other is an int var, cast the int.
+    /// Return the Rust type string for an IR expression where we can determine it.
+    fn infer_expr_type(expr: &IrExpr, sem: &semantic::FunctionSemantics) -> Option<String> {
+        match expr {
+            IrExpr::FloatLit(_)  => Some("f64".to_string()),
+            IrExpr::IntLit(_)    => Some("i64".to_string()),
+            IrExpr::Var(name)    => sem.rust_type_map.get(name).map(|r| r.rust_repr.clone()),
+            IrExpr::FieldAccess { object, field } => {
+                // Try to look up the field type from what we know
+                if let IrExpr::Var(obj_name) = object.as_ref() {
+                    let _ = (obj_name, field); // type not tracked at this level easily
+                }
+                None
+            }
+            IrExpr::Cast { to_type, .. } => Some(to_type.clone()),
+            _ => None,
+        }
+    }
+
+    /// Coerce a numeric pair so both operands have the same float/int type.
+    /// Uses resolved type strings from infer_expr_type (may be None = unknown).
+    fn coerce_numeric_pair(
+        left: IrExpr, right: IrExpr,
+        left_ty: Option<&str>, right_ty: Option<&str>,
+    ) -> (IrExpr, IrExpr) {
+        let left_is_float  = matches!(left_ty,  Some("f32") | Some("f64") | Some("f64"))
+            || matches!(&left,  IrExpr::FloatLit(_));
+        let right_is_float = matches!(right_ty, Some("f32") | Some("f64"))
+            || matches!(&right, IrExpr::FloatLit(_));
+        let left_is_int  = !left_is_float
+            && (matches!(left_ty,  Some("i32") | Some("i64") | Some("usize") | Some("i64"))
+                || matches!(&left,  IrExpr::IntLit(_)));
+        let right_is_int = !right_is_float
+            && (matches!(right_ty, Some("i32") | Some("i64") | Some("usize"))
+                || matches!(&right, IrExpr::IntLit(_)));
+
+        if left_is_float && right_is_int {
+            let float_ty = left_ty.filter(|t| t.starts_with('f')).unwrap_or("f32");
+            let right = match right {
+                IrExpr::IntLit(n) => IrExpr::FloatLit(n as f64),
+                other => IrExpr::Cast { to_type: float_ty.to_string(), expr: Box::new(other) },
+            };
+            return (left, right);
+        }
+        if right_is_float && left_is_int {
+            let float_ty = right_ty.filter(|t| t.starts_with('f')).unwrap_or("f32");
+            let left = match left {
+                IrExpr::IntLit(n) => IrExpr::FloatLit(n as f64),
+                other => IrExpr::Cast { to_type: float_ty.to_string(), expr: Box::new(other) },
+            };
+            return (left, right);
+        }
+        (left, right)
+    }
+
+    fn coerce_mixed_numeric(left: IrExpr, right: IrExpr) -> (IrExpr, IrExpr) {
+        let left_float  = Self::is_float_expr(&left);
+        let right_float = Self::is_float_expr(&right);
+        if left_float && !right_float {
+            let right = match right {
+                IrExpr::IntLit(n) => IrExpr::FloatLit(n as f64),
+                other => IrExpr::Cast { to_type: "f32".to_string(), expr: Box::new(other) },
+            };
+            return (left, right);
+        }
+        if right_float && !left_float {
+            let left = match left {
+                IrExpr::IntLit(n) => IrExpr::FloatLit(n as f64),
+                other => IrExpr::Cast { to_type: "f32".to_string(), expr: Box::new(other) },
+            };
+            return (left, right);
+        }
+        (left, right)
+    }
+
+    fn is_float_expr(expr: &IrExpr) -> bool {
+        match expr {
+            IrExpr::FloatLit(_) => true,
+            IrExpr::Cast { to_type, .. } => to_type == "f32" || to_type == "f64",
+            _ => false,
+        }
+    }
     fn coerce_arg(arg: IrExpr, param_type: &str, _sem: &semantic::FunctionSemantics) -> IrExpr {
         // &mut [T] param: pass fixed array as &mut arr (auto-coercion) or slice ref
         if param_type.starts_with("&mut [") {

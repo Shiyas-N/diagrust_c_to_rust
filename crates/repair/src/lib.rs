@@ -159,6 +159,12 @@ impl RepairEngine {
 
             // ── E0308: type mismatch ──────────────────────────────────────────
             if matches!(err_code, Some("E0308")) {
+                // `expected f32/f64, found integer` — upgrade integer literal to float
+                if diag.message.contains("expected `f32`") || diag.message.contains("expected `f64`") {
+                    let (r, c) = Self::repair_int_to_float_literal(&current, diag);
+                    if c { current = r; actions.push(action("IntToFloat", "Changed integer literal to float literal")); }
+                }
+
                 // Bool/i32 mismatch
                 let (r, c) = Self::repair_type_mismatch(&current, diag);
                 if c { current = r; actions.push(action("TypeMismatch", &format!("Fixed type mismatch: {}", &diag.message[..diag.message.len().min(80)]))); }
@@ -170,6 +176,15 @@ impl RepairEngine {
                 // Slice vs array mismatch: [T;N] where &mut [T] expected
                 let (r, c) = Self::repair_slice_coercion(&current, diag);
                 if c { current = r; actions.push(action("SliceCoercion", "Added &mut arr[..] coercion for slice parameter")); }
+            }
+
+            // ── E0277: cannot divide f32 by i32 ─────────────────────────────
+            if matches!(err_code, Some("E0277"))
+                && diag.message.contains("no implementation for `f")
+                && diag.message.contains("/ i")
+            {
+                let (r, c) = Self::repair_float_int_division(&current, diag);
+                if c { current = r; actions.push(action("FloatDivCast", "Added `as f32` cast on integer divisor")); }
             }
 
             // ── E0277: cannot index non-usize ────────────────────────────────
@@ -204,11 +219,20 @@ impl RepairEngine {
                 if c { current = r; actions.push(action("DoubleMutBorrow", "Resolved double mutable borrow")); }
             }
 
-            // ── E0425: cannot find value (global static mut) ─────────────────
+            // ── E0425: cannot find value ──────────────────────────────────────
             if matches!(err_code, Some("E0425")) && diag.message.contains("cannot find value") {
                 if let Some(var) = Self::extract_undefined_name(&diag.message) {
-                    let (r, c) = Self::repair_global_access(&current, &var);
-                    if c { current = r; actions.push(action("GlobalAccess", &format!("Wrapped access to global '{}' in unsafe block", var))); }
+                    // Primary fix: hoist a `let var: T;` out of any unsafe block
+                    // so it's visible to code outside that block.
+                    let (r, c) = Self::repair_hoist_let_from_unsafe(&current, &var);
+                    if c {
+                        current = r;
+                        actions.push(action("HoistLet", &format!("Hoisted '{}' declaration out of unsafe block", var)));
+                    } else {
+                        // Fallback: wrap stray global access in unsafe
+                        let (r, c) = Self::repair_global_access(&current, &var);
+                        if c { current = r; actions.push(action("GlobalAccess", &format!("Wrapped access to global '{}' in unsafe block", var))); }
+                    }
                 }
             }
 
@@ -379,8 +403,7 @@ impl RepairEngine {
     // ─────────────────────────────────────────────────────────────────────────
 
     fn repair_moved_value(code: &str, diag: &RustcDiagnostic) -> (String, bool) {
-        // Extract variable name
-        let var_re = Regex::new(r"use of moved value: `(\w+)`").unwrap();
+        let var_re    = Regex::new(r"use of moved value: `(\w+)`").unwrap();
         let borrow_re = Regex::new(r"borrow of moved value: `(\w+)`").unwrap();
         let var = var_re.captures(&diag.message)
             .or_else(|| borrow_re.captures(&diag.message))
@@ -388,13 +411,62 @@ impl RepairEngine {
             .map(|m| m.as_str().to_string());
 
         if let Some(var_name) = var {
-            if let Some(line_no) = diag.primary_line() {
-                return Self::insert_clone_at_line(code, &var_name, line_no);
-            }
-            // Fallback: add .clone() to all uses of the variable after its declaration
-            return Self::add_clone_after_first_move(code, &var_name);
+            // Strategy: find the first function call that consumes `var_name` by
+            // value (the move), then add .clone() to every subsequent use in a
+            // function-call argument position. This avoids adding unnecessary
+            // clones to let bindings which are fine.
+            return Self::clone_after_move_in_calls(code, &var_name);
         }
         (code.to_string(), false)
+    }
+
+    /// Add `.clone()` to every function-call argument that passes `var_name` by
+    /// value after its first such use (which causes the move).
+    fn clone_after_move_in_calls(code: &str, var_name: &str) -> (String, bool) {
+        let word_re = Regex::new(&format!(r"\b{}\b", regex::escape(var_name))).unwrap();
+        let clone_suffix = format!("{}.clone()", var_name);
+        // Find all lines that use var_name as a function argument (not let bindings)
+        let lines: Vec<&str> = code.lines().collect();
+        let mut new_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let mut move_seen = false;
+        let mut changed = false;
+
+        for (i, line) in lines.iter().enumerate() {
+            // Skip let-binding lines for the variable itself
+            let is_decl = Regex::new(&format!(r"let\s+(mut\s+)?{}\b", regex::escape(var_name)))
+                .unwrap().is_match(line);
+            if is_decl { continue; }
+
+            // Does this line pass var_name as a function argument?
+            let in_call = line.contains('(') && word_re.is_match(line);
+            if !in_call { continue; }
+
+            if !move_seen {
+                // First call that uses it — this is the move. Mark but don't clone.
+                move_seen = true;
+                continue;
+            }
+
+            // Subsequent uses — add .clone()
+            let mut new_line = String::new();
+            let mut last = 0usize;
+            for m in word_re.find_iter(line) {
+                let after = &line[m.end()..];
+                if after.starts_with(".clone()") {
+                    new_line.push_str(&line[last..m.end()]);
+                    last = m.end();
+                    continue;
+                }
+                new_line.push_str(&line[last..m.start()]);
+                new_line.push_str(&clone_suffix);
+                last = m.end();
+                changed = true;
+            }
+            new_line.push_str(&line[last..]);
+            new_lines[i] = new_line;
+        }
+
+        if changed { (new_lines.join("\n"), true) } else { (code.to_string(), false) }
     }
 
     fn insert_clone_at_line(code: &str, var_name: &str, line_no: usize) -> (String, bool) {
@@ -402,8 +474,26 @@ impl RepairEngine {
         if line_no == 0 || line_no > lines.len() { return (code.to_string(), false); }
         let idx = line_no - 1;
         let line = &lines[idx];
-        let use_re = Regex::new(&format!(r"\b{}\b(?!\.clone\(\))", regex::escape(var_name))).unwrap();
-        let new_line = use_re.replace_all(line, &format!("{}.clone()", var_name)).to_string();
+        // Find bare uses of var_name not already followed by .clone()
+        // Use word-boundary regex without lookahead (not supported by `regex` crate),
+        // then manually skip positions already followed by ".clone()".
+        let word_re = Regex::new(&format!(r"\b{}\b", regex::escape(var_name))).unwrap();
+        let mut new_line = String::new();
+        let mut last = 0usize;
+        let clone_suffix = format!("{}.clone()", var_name);
+        for m in word_re.find_iter(line) {
+            let after = &line[m.end()..];
+            // Already has .clone() — skip
+            if after.starts_with(".clone()") {
+                new_line.push_str(&line[last..m.end()]);
+                last = m.end();
+                continue;
+            }
+            new_line.push_str(&line[last..m.start()]);
+            new_line.push_str(&clone_suffix);
+            last = m.end();
+        }
+        new_line.push_str(&line[last..]);
         if new_line != *line {
             lines[idx] = new_line;
             return (lines.join("\n"), true);
@@ -412,23 +502,34 @@ impl RepairEngine {
     }
 
     fn add_clone_after_first_move(code: &str, var_name: &str) -> (String, bool) {
-        // Find first function call that takes the var by value (no &), add .clone() there
         let call_re = Regex::new(&format!(r"(\w+)\(([^)]*\b{}\b[^)]*)\)", regex::escape(var_name))).unwrap();
+        let clone_suffix = format!("{}.clone()", var_name);
+        let word_re = Regex::new(&format!(r"\b{}\b", regex::escape(var_name))).unwrap();
         let mut found_first = false;
         let mut changed = false;
         let result = call_re.replace_all(code, |caps: &regex::Captures| {
             if !found_first {
                 found_first = true;
-                return caps[0].to_string(); // skip first use (the move)
+                return caps[0].to_string();
             }
-            // Second and later uses: add .clone()
             let args = &caps[2];
-            let fixed = Regex::new(&format!(r"\b{}\b(?!\.clone\(\))", regex::escape(var_name)))
-                .unwrap()
-                .replace_all(args, &format!("{}.clone()", var_name))
-                .to_string();
-            if fixed != args { changed = true; }
-            format!("{}({})", &caps[1], fixed)
+            // Replace bare uses not already followed by .clone()
+            let mut new_args = String::new();
+            let mut last = 0usize;
+            for m in word_re.find_iter(args) {
+                let after = &args[m.end()..];
+                if after.starts_with(".clone()") {
+                    new_args.push_str(&args[last..m.end()]);
+                    last = m.end();
+                    continue;
+                }
+                new_args.push_str(&args[last..m.start()]);
+                new_args.push_str(&clone_suffix);
+                last = m.end();
+                changed = true;
+            }
+            new_args.push_str(&args[last..]);
+            format!("{}({})", &caps[1], new_args)
         }).to_string();
         (result, changed)
     }
@@ -451,9 +552,22 @@ impl RepairEngine {
             let mut lines: Vec<String> = code.lines().map(String::from).collect();
             if line_no > 0 && line_no <= lines.len() {
                 let line = lines[line_no - 1].clone();
-                // Find `*ident` or bare `ident` in a non-ref position
-                let deref_re = Regex::new(r"\*(\w+)(?!\.clone\(\))").unwrap();
-                let new_line = deref_re.replace_all(&line, "(*$1).clone()").to_string();
+                // Find `*ident` not already followed by .clone() and wrap
+                let deref_re = Regex::new(r"\*(\w+)").unwrap();
+                let mut new_line = String::new();
+                let mut last = 0usize;
+                for m in deref_re.find_iter(&line) {
+                    let after = &line[m.end()..];
+                    new_line.push_str(&line[last..m.start()]);
+                    if after.starts_with(".clone()") {
+                        new_line.push_str(m.as_str()); // already has .clone()
+                    } else {
+                        let cap_name = &m.as_str()[1..]; // strip leading *
+                        new_line.push_str(&format!("(*{}).clone()", cap_name));
+                    }
+                    last = m.end();
+                }
+                new_line.push_str(&line[last..]);
                 if new_line != line {
                     lines[line_no - 1] = new_line;
                     return (lines.join("\n"), true);
@@ -521,13 +635,24 @@ impl RepairEngine {
                     // Replace bare `arr` with `&mut arr` at call site, or `arr` with `&mut arr[..]`
                     // Look for function calls in the line
                     let re = Regex::new(r"(\w+)\(([^)]+)\)").unwrap();
+                    let word_re_inner = Regex::new(r"[a-z_]\w*").unwrap();
                     let new_line = re.replace_all(&line, |caps: &regex::Captures| {
                         let args = &caps[2];
-                        // Add &mut to array arguments not already with &mut
-                        let fixed = Regex::new(r"(?<![&*])(\b[a-z_]\w*\b)(?!\[|\.|\()")
-                            .unwrap()
-                            .replace_all(args, "&mut $1")
-                            .to_string();
+                        // Add &mut to bare identifier args not already prefixed by & or *
+                        // and not followed by [ . ( (which would indicate indexing/fields/calls)
+                        let mut fixed = String::new();
+                        let mut last = 0usize;
+                        for m in word_re_inner.find_iter(args) {
+                            let before = &args[..m.start()];
+                            let after  = &args[m.end()..];
+                            let preceded = before.ends_with('&') || before.ends_with('*');
+                            let followed = after.starts_with('[') || after.starts_with('.') || after.starts_with('(');
+                            fixed.push_str(&args[last..m.start()]);
+                            if !preceded && !followed { fixed.push_str("&mut "); }
+                            fixed.push_str(m.as_str());
+                            last = m.end();
+                        }
+                        fixed.push_str(&args[last..]);
                         if fixed != args { format!("{}({})", &caps[1], fixed) }
                         else { caps[0].to_string() }
                     }).to_string();
@@ -757,6 +882,104 @@ impl RepairEngine {
     fn extract_undefined_name(message: &str) -> Option<String> {
         Regex::new(r"cannot find value `(\w+)` in this scope").unwrap()
             .captures(message)?.get(1).map(|m| m.as_str().to_string())
+    }
+
+    /// E0425: variable declared inside `unsafe { let x: T; }` is out of scope
+    /// outside that block.  Find the `let x:` (or `let mut x:`) declaration
+    /// inside an unsafe block and move it ABOVE the unsafe block.
+    fn repair_hoist_let_from_unsafe(code: &str, var: &str) -> (String, bool) {
+        // Use a line-by-line approach — more reliable than regex over multi-line unsafe blocks
+        let lines: Vec<&str> = code.lines().collect();
+        let decl_pat = format!("let {}: ", var);
+        let decl_pat_mut = format!("let mut {}: ", var);
+
+        // Find a line that has the let binding
+        let decl_line_idx = lines.iter().position(|l| {
+            let t = l.trim();
+            (t.starts_with(&decl_pat) || t.starts_with(&decl_pat_mut))
+        });
+        let Some(decl_idx) = decl_line_idx else { return (code.to_string(), false); };
+
+        // Walk upward to find the `unsafe {` that contains this declaration
+        let mut unsafe_open_idx = None;
+        let mut depth = 0i32;
+        for i in (0..=decl_idx).rev() {
+            let l = lines[i].trim();
+            // Count closing braces (going backwards = they open scope)
+            depth += l.chars().filter(|&c| c == '}').count() as i32;
+            depth -= l.chars().filter(|&c| c == '{').count() as i32;
+            if (l.starts_with("unsafe {") || l == "unsafe {") && depth < 0 {
+                unsafe_open_idx = Some(i);
+                break;
+            }
+        }
+        let Some(unsafe_idx) = unsafe_open_idx else { return (code.to_string(), false); };
+
+        // Extract the declaration line (preserve indentation from outer scope)
+        let decl_line = lines[decl_idx];
+        // Reduce indentation by one level (4 spaces) for hoisted position
+        let hoisted_line = if decl_line.starts_with("        ") {
+            format!("    {}", decl_line.trim())
+        } else {
+            decl_line.trim().to_string()
+        };
+
+        // Build new code: insert hoisted decl before the unsafe block, remove it from inside
+        let mut result_lines: Vec<String> = lines.iter()
+            .enumerate()
+            .filter_map(|(i, &l)| if i == decl_idx { None } else { Some(l.to_string()) })
+            .collect();
+
+        // Insert hoisted line before the unsafe block (adjust index because we removed one line)
+        let insert_at = if decl_idx < unsafe_idx { unsafe_idx } else { unsafe_idx };
+        result_lines.insert(insert_at, hoisted_line);
+
+        (result_lines.join("\n"), true)
+    }
+
+    // ── Float / integer type coercion repairs ────────────────────────────────
+
+    /// E0308: `expected f32, found integer` — change bare `= 0;` to `= 0.0;`
+    fn repair_int_to_float_literal(code: &str, diag: &RustcDiagnostic) -> (String, bool) {
+        let line_no = match diag.primary_line() { Some(l) => l, None => return (code.to_string(), false) };
+        let mut lines: Vec<String> = code.lines().map(String::from).collect();
+        if line_no == 0 || line_no > lines.len() { return (code.to_string(), false); }
+        let line = lines[line_no - 1].clone();
+        // Replace patterns like `= 0;` or `= -1;` with their float equivalents
+        let int_re = Regex::new(r"=\s*(-?\d+);").unwrap();
+        let new_line = int_re.replace_all(&line, |caps: &regex::Captures| {
+            format!("= {}.0;", &caps[1])
+        }).to_string();
+        if new_line != line {
+            lines[line_no - 1] = new_line;
+            return (lines.join("\n"), true);
+        }
+        (code.to_string(), false)
+    }
+
+    /// E0277: `no implementation for f32 / i32` — cast the integer operand to f32
+    fn repair_float_int_division(code: &str, diag: &RustcDiagnostic) -> (String, bool) {
+        let line_no = match diag.primary_line() { Some(l) => l, None => return (code.to_string(), false) };
+        let mut lines: Vec<String> = code.lines().map(String::from).collect();
+        if line_no == 0 || line_no > lines.len() { return (code.to_string(), false); }
+        let line = lines[line_no - 1].clone();
+        // Match `expr / var_or_lit` and cast the RHS to f32
+        // e.g. `total / n` → `total / n as f32`
+        let div_re = Regex::new(r"(\w[\w.\[\]]*)\s*/\s*(\w+)").unwrap();
+        let new_line = div_re.replace_all(&line, |caps: &regex::Captures| {
+            let rhs = &caps[2];
+            // Only add cast if not already cast
+            if rhs.ends_with("f32") || rhs.ends_with("f64") {
+                caps[0].to_string()
+            } else {
+                format!("{} / {} as f32", &caps[1], rhs)
+            }
+        }).to_string();
+        if new_line != line {
+            lines[line_no - 1] = new_line;
+            return (lines.join("\n"), true);
+        }
+        (code.to_string(), false)
     }
 
     // ── Pass 0 helpers ────────────────────────────────────────────────────────

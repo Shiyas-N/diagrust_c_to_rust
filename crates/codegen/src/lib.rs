@@ -2,6 +2,7 @@
 
 use ir::*;
 use ast_input::{BinOp, UnaryOp};
+use std::collections::HashSet;
 
 pub struct CodeAssembler;
 
@@ -23,9 +24,31 @@ impl CodeAssembler {
         }
         if !uses.is_empty() { out.push('\n'); }
 
+        // Collect struct names for Copy derive resolution.
+        // A struct whose fields are all Copy (primitives or other Copy structs) is Copy.
+        let struct_names: HashSet<String> = program.structs.iter().map(|s| s.name.clone()).collect();
+        let mut copy_structs: HashSet<String> = HashSet::new();
+
+        // Multi-pass: resolve Copy transitively (struct A has Copy fields → A is Copy;
+        //             struct B has field of type A → B is Copy too).
+        loop {
+            let mut changed = false;
+            for s in &program.structs {
+                if copy_structs.contains(&s.name) { continue; }
+                let all_copy = s.fields.iter().all(|f| {
+                    is_copy_type(&f.rust_type) || copy_structs.contains(&f.rust_type)
+                });
+                if all_copy {
+                    copy_structs.insert(s.name.clone());
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+        }
+
         // Struct definitions
         for s in &program.structs {
-            let all_copy = s.fields.iter().all(|f| is_copy_type(&f.rust_type));
+            let all_copy = copy_structs.contains(&s.name);
             let needs_manual = s.fields.iter().any(|f| needs_manual_default_impl(&f.rust_type));
             if all_copy && !needs_manual {
                 out.push_str("#[derive(Debug, Clone, Copy, Default)]\n");
@@ -52,8 +75,10 @@ impl CodeAssembler {
             out.push('\n');
         }
 
-        // Global variables / constants
+        // Global variables / constants — collect names for function-body rewriting
+        let mut global_names: HashSet<String> = HashSet::new();
         for gv in &program.global_vars {
+            global_names.insert(gv.name.clone());
             if gv.is_const {
                 if let Some(init) = &gv.init {
                     out.push_str(&format!("pub const {}: {} = {};\n",
@@ -69,9 +94,23 @@ impl CodeAssembler {
         }
         if !program.global_vars.is_empty() { out.push('\n'); }
 
-        // Functions
+        // Functions — rewrite global variable references and wrap in unsafe
         for func in &program.functions {
-            out.push_str(&FunctionTranslator::emit(func)?);
+            let mut fn_code = FunctionTranslator::emit(func)?;
+            // Rewrite global variable references: lowercase → UPPERCASE
+            let mut uses_globals = false;
+            for gname in &global_names {
+                let upper = gname.to_uppercase();
+                if fn_code.contains(gname.as_str()) {
+                    fn_code = fn_code.replace(gname, &upper);
+                    uses_globals = true;
+                }
+            }
+            // If this function uses globals, wrap the ENTIRE body in one unsafe block
+            if uses_globals {
+                fn_code = wrap_body_in_unsafe(&fn_code);
+            }
+            out.push_str(&fn_code);
             out.push_str("\n\n");
         }
 
@@ -201,7 +240,21 @@ impl FunctionTranslator {
             IrStatement::LetBinding { name, rust_type, init, is_mutable } => {
                 let mut_kw = if *is_mutable { "mut " } else { "" };
                 let rhs = if let Some(expr) = init {
-                    format!(" = {}", ExprEmitter::emit(expr)?)
+                    let emitted = ExprEmitter::emit(expr)?;
+                    // If the init expression is a comparison but the target type is
+                    // an integer (C's `int result = a > b;`), wrap with
+                    // `if expr { 1 } else { 0 }`.
+                    let is_int_type = matches!(rust_type.as_str(),
+                        "i8"|"i16"|"i32"|"i64"|"u8"|"u16"|"u32"|"u64"|"isize"|"usize");
+                    let is_comparison = matches!(expr,
+                        IrExpr::BinOp { op: BinOp::Greater | BinOp::Less |
+                            BinOp::GreaterEq | BinOp::LessEq |
+                            BinOp::Equal | BinOp::NotEqual, .. });
+                    if is_int_type && is_comparison {
+                        format!(" = if {} {{ 1 }} else {{ 0 }}", emitted)
+                    } else {
+                        format!(" = {}", emitted)
+                    }
                 } else if rust_type.starts_with('[') {
                     if let Some(sz) = extract_array_size(rust_type) {
                         let elem = extract_array_elem_type(rust_type);
@@ -577,4 +630,57 @@ fn binop_precedence(op: &BinOp) -> u8 {
         BinOp::Add   | BinOp::Sub           => 10,
         BinOp::Mul   | BinOp::Div | BinOp::Mod => 11,
     }
+}
+
+/// Wrap the body of a function in a single `unsafe { }` block.
+///
+/// Given code like:
+/// ```text
+/// pub fn foo(x: i32) -> i32 {
+///     GLOBAL = x;
+///     return GLOBAL;
+/// }
+/// ```
+/// Produces:
+/// ```text
+/// pub fn foo(x: i32) -> i32 {
+///     unsafe {
+///     GLOBAL = x;
+///     return GLOBAL;
+///     }
+/// }
+/// ```
+fn wrap_body_in_unsafe(fn_code: &str) -> String {
+    let lines: Vec<&str> = fn_code.lines().collect();
+    if lines.len() < 2 { return fn_code.to_string(); }
+
+    // Find the opening brace of the function
+    let mut open_idx = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim_end().ends_with('{') {
+            open_idx = Some(i);
+            break;
+        }
+    }
+    let Some(open) = open_idx else { return fn_code.to_string(); };
+
+    // The closing brace is the last non-empty line
+    let close = lines.len() - 1;
+    if lines[close].trim() != "}" { return fn_code.to_string(); }
+
+    let mut result: Vec<String> = Vec::new();
+    // Signature line(s) up to and including the opening `{`
+    for line in &lines[..=open] {
+        result.push(line.to_string());
+    }
+    // Insert `unsafe {` right after the opening brace
+    result.push("    unsafe {".to_string());
+    // Body lines — keep as-is (they already have 1 level of indent from FunctionTranslator)
+    for line in &lines[(open + 1)..close] {
+        result.push(line.to_string());
+    }
+    // Close the unsafe block, then the function
+    result.push("    }".to_string());
+    result.push("}".to_string());
+    result.join("\n")
 }

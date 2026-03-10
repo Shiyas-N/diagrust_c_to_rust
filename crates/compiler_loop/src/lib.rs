@@ -332,36 +332,7 @@ impl CompilerLoop {
     // ─────────────────────────────────────────────────────────────────────────
 
     pub fn apply_idiom_pass(code: &str) -> String {
-        let mut out = code.to_string();
-
-        // x = x OP expr  →  x OP= expr  (backup — repair pass runs this too)
-        for (op, compound) in &[("+", "+="), ("-", "-="), ("*", "*="), ("/", "/="), ("%", "%=")] {
-            let pat = format!(r"(?m)^(\s*)(\w+) = \2 \{op} ([^;\n]+);");
-            if let Ok(re) = regex::Regex::new(&pat) {
-                let new = re.replace_all(&out, |caps: &regex::Captures| {
-                    format!("{}{} {} {};", &caps[1], &caps[2], compound, &caps[3])
-                }).to_string();
-                if new != out { out = new; }
-            }
-        }
-
-        // `i += 1` is already idiomatic — no further change needed for increments.
-
-        // `return expr;` as the ONLY statement before a fn-level `}` → trailing expression.
-        // Matches:  <4 spaces>return expr;\n}   (top-level close at column 0)
-        let return_re = regex::Regex::new(r"(?m)^(    )return ([^;{}\n]+);\n\}").unwrap();
-        out = return_re.replace_all(&out, |caps: &regex::Captures| {
-            format!("    {}\n}}", &caps[2])
-        }).to_string();
-
-        // Remove dead `else {}` blocks
-        let empty_else = regex::Regex::new(r" else \{\s*\}").unwrap();
-        out = empty_else.replace_all(&out, "").to_string();
-
-        // Double semicolons from repair
-        out = out.replace(";;", ";");
-
-        out
+        idiom::apply_all(code)
     }
 
     pub fn compile_rust_code(&self, code: &str, temp_dir: &Path) -> Result<CompilationResult> {

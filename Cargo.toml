@@ -6,6 +6,7 @@ members = [
     "crates/ir",
     "crates/codegen",
     "crates/repair",
+    "crates/idiom",
     "crates/compiler_loop",
     "crates/reporting",
     "crates/cli",

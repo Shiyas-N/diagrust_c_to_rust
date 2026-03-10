@@ -56,6 +56,7 @@ Desktop.ini
 
 # Test outputs
 /test_output/
+/test_output_rs/
 /output/
 
 # Temporary rustc directories
@@ -87,3 +88,7 @@ bench_results/
 
 **/*.rlib
 *.rlib
+
+batch*.txt
+build*.txt
+test*.txt

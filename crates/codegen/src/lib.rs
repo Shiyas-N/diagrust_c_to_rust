@@ -303,6 +303,41 @@ impl FunctionTranslator {
                 s
             }
 
+            // ── match (from C switch/case) ────────────────────────────
+            IrStatement::Match { expr, arms, default } => {
+                let mut s = format!("{}match {} {{\n", ind, ExprEmitter::emit(expr)?);
+                for (patterns, body) in arms {
+                    let pat_strs: Vec<String> = patterns.iter()
+                        .map(ExprEmitter::emit)
+                        .collect::<anyhow::Result<_>>()?;
+                    s.push_str(&format!("{}{}  => {{\n", ind1, pat_strs.join(" | ")));
+                    for st in body {
+                        s.push_str(&Self::emit_stmt(st, depth + 2, unsafe_ctx)?);
+                    }
+                    s.push_str(&format!("{}}}\n", ind1));
+                }
+                if let Some(def) = default {
+                    s.push_str(&format!("{}_  => {{\n", ind1));
+                    for st in def {
+                        s.push_str(&Self::emit_stmt(st, depth + 2, unsafe_ctx)?);
+                    }
+                    s.push_str(&format!("{}}}\n", ind1));
+                }
+                s.push_str(&format!("{}}}\n", ind));
+                s
+            }
+
+            // ── loop (from C do-while) ────────────────────────────────
+            IrStatement::Loop { body, condition } => {
+                let mut s = format!("{}loop {{\n", ind);
+                for st in body {
+                    s.push_str(&Self::emit_stmt(st, depth + 1, unsafe_ctx)?);
+                }
+                s.push_str(&format!("{}if !({}) {{ break; }}\n", ind1, ExprEmitter::emit(condition)?));
+                s.push_str(&format!("{}}}\n", ind));
+                s
+            }
+
             IrStatement::UnsafeBlock(stmts) => {
                 // If we're already inside an unsafe context, skip the wrapper
                 if unsafe_ctx {

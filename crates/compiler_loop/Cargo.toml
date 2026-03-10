@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 repair     = { path = "../repair" }
+idiom      = { path = "../idiom" }
 reporting  = { path = "../reporting" }
 anyhow.workspace = true
 thiserror.workspace = true

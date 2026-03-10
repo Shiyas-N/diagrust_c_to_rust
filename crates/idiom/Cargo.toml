@@ -1,0 +1,7 @@
+[package]
+name = "idiom"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+regex.workspace = true

@@ -685,15 +685,47 @@ unsafe fn extract_binary(cursor: clang_sys::CXCursor) -> Option<CExpression> {
     let ch    = collect_children(cursor);
     let left  = extract_expr(*ch.get(0)?)?;
     let right = extract_expr(*ch.get(1)?)?;
-    let op    = binary_op_from_tokens(cursor);
+    let op_token = binary_op_token(cursor);
+
+    // Handle compound assignment operators: expand `x += y` → `x = x + y`
+    let compound_op = match op_token.as_str() {
+        "+=" => Some(BinOp::Add),
+        "-=" => Some(BinOp::Sub),
+        "*=" => Some(BinOp::Mul),
+        "/=" => Some(BinOp::Div),
+        "%=" => Some(BinOp::Mod),
+        "|=" => Some(BinOp::BitOr),
+        "&=" => Some(BinOp::BitAnd),
+        "^=" => Some(BinOp::BitXor),
+        "<<=" => Some(BinOp::Shl),
+        ">>=" => Some(BinOp::Shr),
+        _ => None,
+    };
+
+    if let Some(arith_op) = compound_op {
+        // Expand: left OP= right  →  left = left OP right
+        let expanded_right = CExpression::BinaryOp {
+            left: Box::new(left.clone()),
+            op: arith_op,
+            right: Box::new(right),
+        };
+        return Some(CExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::Assign,
+            right: Box::new(expanded_right),
+        });
+    }
+
+    let op = str_to_binop(&op_token);
     Some(CExpression::BinaryOp { left: Box::new(left), op, right: Box::new(right) })
 }
 
-unsafe fn binary_op_from_tokens(cursor: clang_sys::CXCursor) -> BinOp {
+/// Extract the raw operator token string from a binary/compound-assign expression.
+unsafe fn binary_op_token(cursor: clang_sys::CXCursor) -> String {
     use clang_sys::*;
 
     let ch = collect_children(cursor);
-    if ch.len() < 2 { return BinOp::Add; }
+    if ch.len() < 2 { return "+".to_string(); }
 
     let tu = clang_Cursor_getTranslationUnit(cursor);
 
@@ -714,10 +746,10 @@ unsafe fn binary_op_from_tokens(cursor: clang_sys::CXCursor) -> BinOp {
     let mut toks: *mut CXToken = std::ptr::null_mut();
     let mut n: u32 = 0;
     clang_tokenize(tu, full_range, &mut toks, &mut n);
-    if toks.is_null() || n == 0 { return BinOp::Add; }
+    if toks.is_null() || n == 0 { return "+".to_string(); }
 
     let tokens = std::slice::from_raw_parts(toks, n as usize);
-    let mut op = BinOp::Add;
+    let mut result = "+".to_string();
 
     for tok in tokens {
         if clang_getTokenKind(*tok) != CXToken_Punctuation { continue; }
@@ -732,13 +764,13 @@ unsafe fn binary_op_from_tokens(cursor: clang_sys::CXCursor) -> BinOp {
                 "(" | ")" | "[" | "]" | "." | "->" | ";" | "{" | "}" => continue,
                 _ => {}
             }
-            op = str_to_binop(&sp);
+            result = sp;
             break;
         }
     }
 
     clang_disposeTokens(tu, toks, n);
-    op
+    result
 }
 
 fn str_to_binop(s: &str) -> BinOp {
@@ -756,7 +788,10 @@ fn str_to_binop(s: &str) -> BinOp {
         ">=" => BinOp::GreaterEq,
         "&&" => BinOp::And,
         "||" => BinOp::Or,
-        "=" | "+=" | "-=" | "*=" | "/=" | "%=" => BinOp::Assign,
+        "=" => BinOp::Assign,
+        // Compound assignments should be handled by extract_binary before reaching here,
+        // but just in case, treat them as Assign as a fallback.
+        "+=" | "-=" | "*=" | "/=" | "%=" | "|=" | "&=" | "^=" | "<<=" | ">>=" => BinOp::Assign,
         "&"  => BinOp::BitAnd,
         "|"  => BinOp::BitOr,
         "^"  => BinOp::BitXor,

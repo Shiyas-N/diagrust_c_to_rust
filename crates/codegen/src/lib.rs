@@ -386,7 +386,12 @@ impl FunctionTranslator {
                 for st in body {
                     s.push_str(&Self::emit_stmt(st, depth + 1, unsafe_ctx)?);
                 }
-                s.push_str(&format!("{}if !({}) {{ break; }}\n", ind1, ExprEmitter::emit(condition)?));
+                // Skip break condition for infinite loops: while(1) or while(true)
+                let is_infinite = matches!(condition,
+                    IrExpr::IntLit(1) | IrExpr::BoolLit(true));
+                if !is_infinite {
+                    s.push_str(&format!("{}if !({}) {{ break; }}\n", ind1, ExprEmitter::emit(condition)?));
+                }
                 s.push_str(&format!("{}}}\n", ind));
                 s
             }

@@ -27,6 +27,22 @@ impl IrBuilder {
             .map(|g| g.name.clone())
             .collect();
 
+        // Build a map from function name → upgraded Rust return type.
+        // This lets VarDecl builder upgrade `*mut T` variable types when they
+        // receive the result of a function that now returns `&mut T`.
+        let fn_return_types: HashMap<String, String> = program.functions.iter().map(|f| {
+            let raw_ret = Self::fallback_type(&f.return_type);
+            let upgraded = if raw_ret.starts_with("*mut ") {
+                let inner = &raw_ret["*mut ".len()..];
+                let has_ptr_param = f.parameters.iter().any(|p| {
+                    let pt = Self::fallback_type(&p.param_type);
+                    pt == format!("*mut {}", inner) || pt == format!("&mut {}", inner)
+                });
+                if has_ptr_param { format!("&mut {}", inner) } else { raw_ret }
+            } else { raw_ret };
+            (f.name.clone(), upgraded)
+        }).collect();
+
         let fn_param_types: HashMap<String, Vec<String>> = program.functions.iter().map(|f| {
             let array_params = Self::detect_array_params(f);
             // Check if this function returns *mut T (will be upgraded to &mut T)
@@ -63,7 +79,8 @@ impl IrBuilder {
 
         for (func, sem) in program.functions.iter().zip(semantic.functions.iter()) {
             let ir_func = Self::build_function(
-                func, sem, &mut required_uses, &struct_fields, &global_names, &fn_param_types
+                func, sem, &mut required_uses, &struct_fields, &global_names,
+                &fn_param_types, &fn_return_types,
             )?;
             functions.push(ir_func);
         }
@@ -105,6 +122,85 @@ impl IrBuilder {
     }
 
     // ── Array parameter detection ────────────────────────────────────────────
+
+    /// Post-process body statements: when a `let var: *mut T` is initialised by
+    /// a call to a function whose return type has been upgraded to `&mut T`,
+    /// upgrade the variable type to `&mut T` and mark it mutable.
+    /// Also mark variables `mut` when they appear as `&mut var` call arguments
+    /// so that Rust accepts taking a mutable reference from them.
+    fn upgrade_ptr_return_bindings(
+        stmts: Vec<IrStatement>,
+        fn_return_types: &HashMap<String, String>,
+    ) -> Vec<IrStatement> {
+        // Collect names of variables that are passed as &mut somewhere in the body,
+        // so we can mark their declarations mutable.
+        let mut mut_ref_vars: HashSet<String> = HashSet::new();
+        Self::collect_mut_ref_vars(&stmts, &mut mut_ref_vars);
+
+        stmts.into_iter().map(|stmt| {
+            match stmt {
+                IrStatement::LetBinding { name, rust_type, init, is_mutable } => {
+                    // Upgrade `*mut T` → `&mut T` when the init is a call to a
+                    // function that now returns `&mut T`.
+                    let upgraded_type = if rust_type.starts_with("*mut ") {
+                        if let Some(Some(fn_name)) = init.as_ref().map(|e| match e {
+                            IrExpr::Call { function, .. } => Some(function.as_str()),
+                            _ => None,
+                        }) {
+                            if let Some(ret) = fn_return_types.get(fn_name) {
+                                if ret.starts_with("&mut ") { ret.clone() } else { rust_type }
+                            } else { rust_type }
+                        } else { rust_type }
+                    } else { rust_type };
+
+                    // Also mark the binding mutable if the variable is used as &mut arg
+                    let needs_mut = is_mutable || mut_ref_vars.contains(&name);
+                    IrStatement::LetBinding { name, rust_type: upgraded_type, init, is_mutable: needs_mut }
+                }
+                other => other,
+            }
+        }).collect()
+    }
+
+    /// Walk all expressions in `stmts` and collect variable names that appear
+    /// directly as `IrExpr::RefMut(Var(name))` — i.e., passed as `&mut name`.
+    fn collect_mut_ref_vars(stmts: &[IrStatement], out: &mut HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                IrStatement::Expr(e) | IrStatement::Return(Some(e)) => Self::scan_expr_for_mut_ref(e, out),
+                IrStatement::LetBinding { init: Some(e), .. } => Self::scan_expr_for_mut_ref(e, out),
+                IrStatement::Assign { value, .. } => Self::scan_expr_for_mut_ref(value, out),
+                IrStatement::If { condition, then_block, else_block } => {
+                    Self::scan_expr_for_mut_ref(condition, out);
+                    Self::collect_mut_ref_vars(then_block, out);
+                    if let Some(eb) = else_block { Self::collect_mut_ref_vars(eb, out); }
+                }
+                IrStatement::While { condition, body } => {
+                    Self::scan_expr_for_mut_ref(condition, out);
+                    Self::collect_mut_ref_vars(body, out);
+                }
+                IrStatement::While2 { body, .. } => Self::collect_mut_ref_vars(body, out),
+                IrStatement::Loop { body, .. } => Self::collect_mut_ref_vars(body, out),
+                _ => {}
+            }
+        }
+    }
+
+    fn scan_expr_for_mut_ref(expr: &IrExpr, out: &mut HashSet<String>) {
+        match expr {
+            IrExpr::RefMut(inner) => {
+                if let IrExpr::Var(name) = inner.as_ref() { out.insert(name.clone()); }
+                Self::scan_expr_for_mut_ref(inner, out);
+            }
+            IrExpr::Call { args, .. } => { for a in args { Self::scan_expr_for_mut_ref(a, out); } }
+            IrExpr::BinOp { left, right, .. } => {
+                Self::scan_expr_for_mut_ref(left, out);
+                Self::scan_expr_for_mut_ref(right, out);
+            }
+            IrExpr::UnaryOp { operand, .. } => Self::scan_expr_for_mut_ref(operand, out),
+            _ => {}
+        }
+    }
 
     fn detect_array_params(func: &ast_input::CFunction) -> HashSet<String> {
         let param_names: HashSet<&str> = func.parameters.iter().map(|p| p.name.as_str()).collect();
@@ -204,6 +300,7 @@ impl IrBuilder {
         struct_fields: &HashMap<String, Vec<String>>,
         global_names: &HashSet<String>,
         fn_param_types: &HashMap<String, Vec<String>>,
+        fn_return_types: &HashMap<String, String>,
     ) -> anyhow::Result<IrFunction> {
         let is_main = func.name == "main";
 
@@ -282,6 +379,9 @@ impl IrBuilder {
         };
 
         let raw_body = Self::build_stmts(&func.body, sem, struct_fields, fn_param_types)?;
+        // Post-process: upgrade `let m: *mut T = fn_call()` to `let mut m: &mut T`
+        // when fn_call's return type has been upgraded from *mut T to &mut T.
+        let raw_body = Self::upgrade_ptr_return_bindings(raw_body, fn_return_types);
         let raw_body = if is_main { Self::strip_main_return(raw_body) } else { raw_body };
 
         let raw_body = Self::rewrite_swap_patterns(raw_body);
@@ -866,6 +966,183 @@ impl IrBuilder {
                             .unwrap_or(IrExpr::IntLit(0));
                         return Ok(IrExpr::Exit(Box::new(code)));
                     }
+
+                    // ── String length: strlen(s) → s.len() ──────────────────
+                    "strlen" => {
+                        if let Some(s) = args.first() {
+                            let obj = Self::build_expr(s, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::FieldAccess {
+                                object: Box::new(obj),
+                                field: "len()".to_string(),
+                            });
+                        }
+                    }
+
+                    // ── String compare: strcmp(a,b) → a.cmp(&b) as i32 ──────
+                    "strcmp" | "strcasecmp" => {
+                        if args.len() >= 2 {
+                            let a = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let b = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strcmp__".to_string(),
+                                args: vec![a, b],
+                            });
+                        }
+                    }
+
+                    // ── String copy: strcpy(dst, src) → dst = src.clone() ────
+                    "strcpy" | "strncpy" => {
+                        if args.len() >= 2 {
+                            let src = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Clone(Box::new(src)));
+                        }
+                    }
+
+                    // ── String concat: strcat(dst, src) → dst.push_str(&src) ─
+                    "strcat" | "strncat" => {
+                        if args.len() >= 2 {
+                            let dst = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let src = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strcat__".to_string(),
+                                args: vec![dst, src],
+                            });
+                        }
+                    }
+
+                    // ── Char classification / conversion ─────────────────────
+                    "isdigit" => {
+                        if let Some(c) = args.first() {
+                            let obj = Self::build_expr(c, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::FieldAccess {
+                                object: Box::new(IrExpr::Cast { to_type: "u8".to_string(), expr: Box::new(obj) }),
+                                field: "is_ascii_digit()".to_string(),
+                            });
+                        }
+                    }
+                    "isalpha" => {
+                        if let Some(c) = args.first() {
+                            let obj = Self::build_expr(c, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::FieldAccess {
+                                object: Box::new(IrExpr::Cast { to_type: "u8".to_string(), expr: Box::new(obj) }),
+                                field: "is_ascii_alphabetic()".to_string(),
+                            });
+                        }
+                    }
+                    "isalnum" => {
+                        if let Some(c) = args.first() {
+                            let obj = Self::build_expr(c, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::FieldAccess {
+                                object: Box::new(IrExpr::Cast { to_type: "u8".to_string(), expr: Box::new(obj) }),
+                                field: "is_ascii_alphanumeric()".to_string(),
+                            });
+                        }
+                    }
+                    "isupper" => {
+                        if let Some(c) = args.first() {
+                            let obj = Self::build_expr(c, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::FieldAccess {
+                                object: Box::new(IrExpr::Cast { to_type: "u8".to_string(), expr: Box::new(obj) }),
+                                field: "is_ascii_uppercase()".to_string(),
+                            });
+                        }
+                    }
+                    "islower" => {
+                        if let Some(c) = args.first() {
+                            let obj = Self::build_expr(c, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::FieldAccess {
+                                object: Box::new(IrExpr::Cast { to_type: "u8".to_string(), expr: Box::new(obj) }),
+                                field: "is_ascii_lowercase()".to_string(),
+                            });
+                        }
+                    }
+                    "isspace" => {
+                        if let Some(c) = args.first() {
+                            let obj = Self::build_expr(c, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::FieldAccess {
+                                object: Box::new(IrExpr::Cast { to_type: "u8".to_string(), expr: Box::new(obj) }),
+                                field: "is_ascii_whitespace()".to_string(),
+                            });
+                        }
+                    }
+                    "toupper" => {
+                        if let Some(c) = args.first() {
+                            let obj = Self::build_expr(c, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::FieldAccess {
+                                object: Box::new(IrExpr::Cast { to_type: "u8".to_string(), expr: Box::new(obj) }),
+                                field: "to_ascii_uppercase()".to_string(),
+                            });
+                        }
+                    }
+                    "tolower" => {
+                        if let Some(c) = args.first() {
+                            let obj = Self::build_expr(c, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::FieldAccess {
+                                object: Box::new(IrExpr::Cast { to_type: "u8".to_string(), expr: Box::new(obj) }),
+                                field: "to_ascii_lowercase()".to_string(),
+                            });
+                        }
+                    }
+
+                    // ── Memory: memset(arr, val, n) → arr.fill(val) ──────────
+                    "memset" => {
+                        if args.len() >= 2 {
+                            let arr = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let val = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__memset__".to_string(),
+                                args: vec![arr, val],
+                            });
+                        }
+                    }
+
+                    // ── Memory: memcpy(dst, src, n) → dst.copy_from_slice(src) ─
+                    "memcpy" | "memmove" => {
+                        if args.len() >= 2 {
+                            let dst = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let src = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__memcpy__".to_string(),
+                                args: vec![dst, src],
+                            });
+                        }
+                    }
+
+                    // ── Memory: memcmp(a, b, n) → a == b ────────────────────
+                    "memcmp" => {
+                        if args.len() >= 2 {
+                            let a = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let b = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::BinOp {
+                                left: Box::new(a),
+                                op: ast_input::BinOp::Equal,
+                                right: Box::new(b),
+                            });
+                        }
+                    }
+
+                    // ── min/max from algorithm.h ─────────────────────────────
+                    "min" | "MIN" => {
+                        if args.len() >= 2 {
+                            let a = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let b = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "std::cmp::min".to_string(),
+                                args: vec![a, b],
+                            });
+                        }
+                    }
+                    "max" | "MAX" => {
+                        if args.len() >= 2 {
+                            let a = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let b = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "std::cmp::max".to_string(),
+                                args: vec![a, b],
+                            });
+                        }
+                    }
+
                     _ => {}
                 }
                 let rust_fn = Self::map_stdlib_fn(function);
@@ -942,16 +1219,70 @@ impl IrBuilder {
 
     fn map_stdlib_fn(name: &str) -> String {
         match name {
-            "abs"   => "i32::abs".to_string(),
-            "fabs"  => "f64::abs".to_string(),
-            "sqrt"  => "f64::sqrt".to_string(),
-            "pow"   => "f64::powi".to_string(),
-            "floor" => "f64::floor".to_string(),
-            "ceil"  => "f64::ceil".to_string(),
-            "rand"  => "rand::random::<i32>".to_string(),
-            "atoi"  => "str::parse::<i32>".to_string(),
-            "atof"  => "str::parse::<f64>".to_string(),
-            other   => other.to_string(),
+            // ── Integer math ────────────────────────────────────────────────
+            "abs"    => "i32::abs".to_string(),
+            "labs"   => "i64::abs".to_string(),
+            "llabs"  => "i128::abs".to_string(),
+
+            // ── Floating-point math (double) ─────────────────────────────────
+            "fabs"   => "f64::abs".to_string(),
+            "sqrt"   => "f64::sqrt".to_string(),
+            "cbrt"   => "f64::cbrt".to_string(),
+            "pow"    => "f64::powi".to_string(),
+            "floor"  => "f64::floor".to_string(),
+            "ceil"   => "f64::ceil".to_string(),
+            "round"  => "f64::round".to_string(),
+            "trunc"  => "f64::trunc".to_string(),
+            "fmod"   => "f64::rem_euclid".to_string(),
+            "exp"    => "f64::exp".to_string(),
+            "exp2"   => "f64::exp2".to_string(),
+            "log"    => "f64::ln".to_string(),
+            "log2"   => "f64::log2".to_string(),
+            "log10"  => "f64::log10".to_string(),
+            "sin"    => "f64::sin".to_string(),
+            "cos"    => "f64::cos".to_string(),
+            "tan"    => "f64::tan".to_string(),
+            "asin"   => "f64::asin".to_string(),
+            "acos"   => "f64::acos".to_string(),
+            "atan"   => "f64::atan".to_string(),
+            "atan2"  => "f64::atan2".to_string(),
+            "sinh"   => "f64::sinh".to_string(),
+            "cosh"   => "f64::cosh".to_string(),
+            "tanh"   => "f64::tanh".to_string(),
+            "hypot"  => "f64::hypot".to_string(),
+            "fmax"   => "f64::max".to_string(),
+            "fmin"   => "f64::min".to_string(),
+
+            // ── Floating-point math (float) ──────────────────────────────────
+            "fabsf"  => "f32::abs".to_string(),
+            "sqrtf"  => "f32::sqrt".to_string(),
+            "cbrtf"  => "f32::cbrt".to_string(),
+            "powf"   => "f32::powi".to_string(),
+            "floorf" => "f32::floor".to_string(),
+            "ceilf"  => "f32::ceil".to_string(),
+            "roundf" => "f32::round".to_string(),
+            "truncf" => "f32::trunc".to_string(),
+            "expf"   => "f32::exp".to_string(),
+            "logf"   => "f32::ln".to_string(),
+            "log2f"  => "f32::log2".to_string(),
+            "log10f" => "f32::log10".to_string(),
+            "sinf"   => "f32::sin".to_string(),
+            "cosf"   => "f32::cos".to_string(),
+            "tanf"   => "f32::tan".to_string(),
+            "asinf"  => "f32::asin".to_string(),
+            "acosf"  => "f32::acos".to_string(),
+            "atanf"  => "f32::atan".to_string(),
+            "atan2f" => "f32::atan2".to_string(),
+            "fmaxf"  => "f32::max".to_string(),
+            "fminf"  => "f32::min".to_string(),
+
+            // ── Random / conversion ──────────────────────────────────────────
+            "rand"   => "rand::random::<i32>".to_string(),
+            "atoi"   => "str::parse::<i32>".to_string(),
+            "atof"   => "str::parse::<f64>".to_string(),
+            "atol"   => "str::parse::<i64>".to_string(),
+
+            other    => other.to_string(),
         }
     }
 
@@ -1092,6 +1423,9 @@ impl IrBuilder {
         if param_type.starts_with("&mut ") && !param_type.starts_with("&mut [") {
             match arg {
                 IrExpr::Ref(inner) => return IrExpr::RefMut(inner),
+                // C `&x` is parsed as UnaryOp{AddrOf, x} → must also upgrade to &mut x
+                IrExpr::UnaryOp { op: ast_input::UnaryOp::AddrOf, operand } =>
+                    return IrExpr::RefMut(operand),
                 IrExpr::Var(ref _name) => return IrExpr::RefMut(Box::new(arg)),
                 other => return other,
             }

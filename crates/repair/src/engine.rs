@@ -26,6 +26,16 @@ impl RepairEngine {
         let (r, c) = Self::repair_compound_assignments(&current);
         if c { current = r; actions.push(action("CompoundAssign", "Replaced x = x OP expr with x OP= expr")); }
 
+        // When call arguments use &mut var, the var binding needs `mut`.
+        // Run this early so subsequent passes see the correct declarations.
+        let (r, c) = Self::repair_mut_bindings_for_mut_ref_args(&current);
+        if c { current = r; actions.push(action("MutBindingForMutRef", "Added `mut` to variable bindings used as &mut arguments")); }
+
+        // When a let binding has type `*mut T` but is assigned from a function
+        // that returns `&mut T`, upgrade the declared type.
+        let (r, c) = Self::repair_ptr_return_type_in_binding(&current);
+        if c { current = r; actions.push(action("PtrReturnTypeUpgrade", "Upgraded *mut T to &mut T in let binding assigned from reference-returning fn")); }
+
         // Proactively strip imports that are only needed when certain features are used.
         // This avoids unused-import warnings even before the first compiler run.
         let (r, c) = Self::strip_unused_io_import(&current);
@@ -868,6 +878,53 @@ impl RepairEngine {
             }
         }
         (result, changed)
+    }
+
+    /// When code contains `func(&mut x, ...)`, the binding `let x` must be
+    /// `let mut x`. Scan all `&mut <ident>` patterns in call positions and
+    /// add `mut` to the corresponding let-bindings if missing.
+    fn repair_mut_bindings_for_mut_ref_args(code: &str) -> (String, bool) {
+        let arg_re = Regex::new(r"&mut\s+([a-z_][a-z_0-9]*)").unwrap();
+        let sig_re = Regex::new(r"(?:pub\s+)?fn\s+\w+\s*\(").unwrap();
+        let mut vars_needing_mut: std::collections::HashSet<String> = Default::default();
+
+        for line in code.lines() {
+            if sig_re.is_match(line) { continue; }
+            for cap in arg_re.captures_iter(line) {
+                vars_needing_mut.insert(cap[1].to_string());
+            }
+        }
+
+        let mut result = code.to_string();
+        let mut changed = false;
+        for var in &vars_needing_mut {
+            for (pat, rep) in &[
+                (format!("let {}: ",  var), format!("let mut {}: ",  var)),
+                (format!("let {} = ", var), format!("let mut {} = ", var)),
+                (format!("let {}=",   var), format!("let mut {}=",   var)),
+            ] {
+                if result.contains(pat.as_str()) && !result.contains(rep.as_str()) {
+                    result = result.replacen(pat.as_str(), rep.as_str(), 1);
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        (result, changed)
+    }
+
+    /// Fix `let [mut] var: *mut T = fn_call(&mut ...)` → `let mut var: &mut T`.
+    fn repair_ptr_return_type_in_binding(code: &str) -> (String, bool) {
+        let binding_re = Regex::new(
+            r"(let\s+(?:mut\s+)?)(\w+)(\s*:\s*)\*mut\s+(\w+)(\s*=\s*\w+\([^)]*&mut)"
+        ).unwrap();
+        if binding_re.is_match(code) {
+            let result = binding_re.replace_all(code, |caps: &regex::Captures| {
+                format!("let mut {}{}&mut {}{}", &caps[2], &caps[3], &caps[4], &caps[5])
+            }).to_string();
+            if result != code { return (result, true); }
+        }
+        (code.to_string(), false)
     }
 }
 

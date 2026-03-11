@@ -518,6 +518,23 @@ impl ExprEmitter {
                         return Ok(format!("{}.to_vec()", Self::emit(arr)?));
                     }
                 }
+                // ── C stdlib sentinel translations ───────────────────────────
+                // strcmp(a, b) → a.cmp(&b) as i32  (0=eq, neg=lt, pos=gt)
+                if function == "__strcmp__" && args.len() == 2 {
+                    return Ok(format!("{}.cmp(&{}) as i32", Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+                // strcat(dst, src) → { dst.push_str(&src); dst }
+                if function == "__strcat__" && args.len() == 2 {
+                    return Ok(format!("{{ {}.push_str(&{}); }}", Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+                // memset(arr, val) → arr.fill(val)
+                if function == "__memset__" && args.len() == 2 {
+                    return Ok(format!("{}.fill({})", Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+                // memcpy(dst, src) → dst.copy_from_slice(&src)
+                if function == "__memcpy__" && args.len() == 2 {
+                    return Ok(format!("{}.copy_from_slice(&{})", Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
                 let args_str = args.iter()
                     .map(Self::emit)
                     .collect::<anyhow::Result<Vec<_>>>()?
@@ -550,8 +567,16 @@ impl ExprEmitter {
 
             IrExpr::StructDefault(name) => format!("{}::default()", name),
 
-            IrExpr::FieldAccess { object, field } =>
-                format!("{}.{}", Self::emit(object)?, field),
+            IrExpr::FieldAccess { object, field } => {
+                // For C char/string function translations, the `field` may already include
+                // parentheses (e.g. "is_ascii_digit()" from isdigit translation).
+                // Emit as a method call in that case.
+                if field.ends_with(')') {
+                    format!("{}.{}", Self::emit(object)?, field)
+                } else {
+                    format!("{}.{}", Self::emit(object)?, field)
+                }
+            }
 
             IrExpr::StructLiteral { struct_type, fields } => {
                 let mut s = format!("{} {{ ", struct_type);

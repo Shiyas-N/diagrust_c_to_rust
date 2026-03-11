@@ -257,10 +257,6 @@ impl IrBuilder {
         if sem.ownership_map.values().any(|o| *o == OwnershipKind::InteriorMutable) {
             uses.insert("std::cell::RefCell".to_string());
         }
-        // Raw pointers need std::ptr for null/null_mut helpers
-        if sem.ownership_map.values().any(|o| *o == OwnershipKind::RawPointer) {
-            uses.insert("std::ptr".to_string());
-        }
 
         let rust_return_type = if is_main {
             "()".to_string()
@@ -979,14 +975,6 @@ impl IrBuilder {
             CType::Bool   => "bool".to_string(),
             CType::Float  => "f32".to_string(),
             CType::Double => "f64".to_string(),
-            // char* → String (idiomatic Rust string)
-            CType::Pointer(inner) if matches!(inner.as_ref(), CType::Char | CType::UChar) => {
-                "String".to_string()
-            }
-            // void* → *mut u8 (unsafe raw)
-            CType::Pointer(inner) if matches!(inner.as_ref(), CType::Void) => {
-                "*mut u8".to_string()
-            }
             CType::Pointer(inner) => format!("*mut {}", Self::fallback_type(inner)),
             CType::Array(inner, Some(n)) => format!("[{}; {}]", Self::fallback_type(inner), n),
             CType::Array(inner, None)    => format!("Vec<{}>",  Self::fallback_type(inner)),

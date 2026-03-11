@@ -165,12 +165,22 @@ impl MutabilityAnalyser {
         match stmt {
             CStatement::Assignment { target, .. } => { set.insert(target.clone()); }
             CStatement::IndexedAssignment { array, .. } => { set.insert(array.clone()); }
-            CStatement::FieldAssignment { object, .. } => { set.insert(object.clone()); }
+            CStatement::FieldAssignment { object, .. } => {
+                // Only the root object variable needs mut (e.g. "p1" from "p1.x = …")
+                let root = object.split('.').next().unwrap_or(object.as_str());
+                set.insert(root.to_string());
+            }
             CStatement::If { then_body, else_body, .. } => {
                 for s in then_body { Self::from_statement(s, set); }
                 if let Some(eb) = else_body { for s in eb { Self::from_statement(s, set); } }
             }
-            CStatement::While { body, .. } => { for s in body { Self::from_statement(s, set); } }
+            CStatement::While { body, .. } => {
+                for s in body { Self::from_statement(s, set); }
+            }
+            // ── do-while: body variables are mutated ──────────────────────
+            CStatement::DoWhile { body, .. } => {
+                for s in body { Self::from_statement(s, set); }
+            }
             CStatement::For { init, increment, body, .. } => {
                 Self::from_statement(init, set);
                 // The increment expression (e.g. `i = i + 1`) mutates the loop variable.
@@ -178,12 +188,20 @@ impl MutabilityAnalyser {
                 Self::from_expr_assignments(increment, set);
                 for s in body { Self::from_statement(s, set); }
             }
+            CStatement::Switch { cases, default, .. } => {
+                for (_, body) in cases { for s in body { Self::from_statement(s, set); } }
+                if let Some(d) = default { for s in d { Self::from_statement(s, set); } }
+            }
+            // Expression statements: recurse to catch address-of and other mutations
+            CStatement::Expression(e) => { Self::from_expr_assignments(e, set); }
             _ => {}
         }
     }
 
-    /// Walk an expression and collect any variable names on the left-hand side
-    /// of an assignment operator — used to detect for-loop increment mutations.
+    /// Walk an expression and collect mutated variable names:
+    ///  - LHS of assignment (`x = …`)
+    ///  - Address-of (`&x`) — callee may write through the pointer
+    ///  - Call arguments (recurse to catch nested &var)
     fn from_expr_assignments(expr: &CExpression, set: &mut HashSet<String>) {
         match expr {
             CExpression::BinaryOp { left, op: BinOp::Assign, .. } => {
@@ -194,6 +212,16 @@ impl MutabilityAnalyser {
             CExpression::BinaryOp { left, right, .. } => {
                 Self::from_expr_assignments(left, set);
                 Self::from_expr_assignments(right, set);
+            }
+            // &var  — address-of means the callee may write through this pointer
+            CExpression::UnaryOp { op: UnaryOp::AddrOf, operand } => {
+                if let CExpression::Variable(name) = operand.as_ref() {
+                    set.insert(name.clone());
+                }
+            }
+            // Recurse into call arguments — they may contain &var
+            CExpression::Call { args, .. } => {
+                for a in args { Self::from_expr_assignments(a, set); }
             }
             _ => {}
         }

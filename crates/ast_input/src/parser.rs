@@ -721,6 +721,10 @@ unsafe fn extract_binary(cursor: clang_sys::CXCursor) -> Option<CExpression> {
 }
 
 /// Extract the raw operator token string from a binary/compound-assign expression.
+///
+/// Uses token-index arithmetic: tokenise the left operand separately to know
+/// how many tokens it occupies, then skip past them in the full-expression
+/// token list to find the operator.  This works even without spaces (i<10).
 unsafe fn binary_op_token(cursor: clang_sys::CXCursor) -> String {
     use clang_sys::*;
 
@@ -728,51 +732,75 @@ unsafe fn binary_op_token(cursor: clang_sys::CXCursor) -> String {
     if ch.len() < 2 { return "+".to_string(); }
 
     let tu = clang_Cursor_getTranslationUnit(cursor);
-
     let left_range  = clang_getCursorExtent(ch[0]);
     let right_range = clang_getCursorExtent(ch[1]);
+    let full_range  = clang_getCursorExtent(cursor);
 
-    let left_end   = clang_getRangeEnd(left_range);
-    let right_start = clang_getRangeStart(right_range);
+    // Tokenise left operand alone to count its tokens
+    let mut left_toks: *mut CXToken = std::ptr::null_mut();
+    let mut left_n: u32 = 0;
+    clang_tokenize(tu, left_range, &mut left_toks, &mut left_n);
+    let left_count = left_n as usize;
+    if !left_toks.is_null() { clang_disposeTokens(tu, left_toks, left_n); }
 
-    let mut left_offset  = 0u32;
-    let mut right_offset = 0u32;
-    let mut file: CXFile = std::ptr::null_mut();
+    // Tokenise right operand alone to count its tokens
+    let mut right_toks: *mut CXToken = std::ptr::null_mut();
+    let mut right_n: u32 = 0;
+    clang_tokenize(tu, right_range, &mut right_toks, &mut right_n);
+    let right_count = right_n as usize;
+    if !right_toks.is_null() { clang_disposeTokens(tu, right_toks, right_n); }
 
-    clang_getSpellingLocation(left_end,   &mut file, std::ptr::null_mut(), std::ptr::null_mut(), &mut left_offset);
-    clang_getSpellingLocation(right_start, &mut file, std::ptr::null_mut(), std::ptr::null_mut(), &mut right_offset);
-
-    let full_range = clang_getCursorExtent(cursor);
+    // Tokenise full expression
     let mut toks: *mut CXToken = std::ptr::null_mut();
     let mut n: u32 = 0;
     clang_tokenize(tu, full_range, &mut toks, &mut n);
     if toks.is_null() || n == 0 { return "+".to_string(); }
-
     let tokens = std::slice::from_raw_parts(toks, n as usize);
-    let mut result = "+".to_string();
+    let total = n as usize;
 
-    for tok in tokens {
-        if clang_getTokenKind(*tok) != CXToken_Punctuation { continue; }
+    // The operator sits between the left tokens and right tokens in the stream.
+    // [0..left_count) = left operand tokens
+    // [left_count..total-right_count) = operator token(s)
+    // [total-right_count..total) = right operand tokens
+    let op_start = left_count;
+    let op_end   = if total > right_count { total - right_count } else { op_start + 1 };
 
-        let tok_loc = clang_getTokenLocation(tu, *tok);
-        let mut tok_offset = 0u32;
-        clang_getSpellingLocation(tok_loc, &mut file, std::ptr::null_mut(), std::ptr::null_mut(), &mut tok_offset);
+    let mut result = String::new();
+    'outer: for i in op_start..op_end.min(total) {
+        if clang_getTokenKind(tokens[i]) != CXToken_Punctuation { continue; }
+        let sp = cx_string(clang_getTokenSpelling(tu, tokens[i]));
+        match sp.as_str() {
+            "(" | ")" | "[" | "]" | "." | "->" | ";" | "{" | "}" | "," => continue,
+            _ => { result = sp; break 'outer; }
+        }
+    }
 
-        if tok_offset > left_offset && tok_offset < right_offset {
-            let sp = cx_string(clang_getTokenSpelling(tu, *tok));
-            match sp.as_str() {
-                "(" | ")" | "[" | "]" | "." | "->" | ";" | "{" | "}" => continue,
-                _ => {}
+    // Fallback: offset-based scan (handles edge cases where token counts differ)
+    if result.is_empty() {
+        let left_end    = clang_getRangeEnd(left_range);
+        let right_start = clang_getRangeStart(right_range);
+        let mut loff = 0u32; let mut roff = 0u32;
+        let mut file: CXFile = std::ptr::null_mut();
+        clang_getSpellingLocation(left_end,    &mut file, std::ptr::null_mut(), std::ptr::null_mut(), &mut loff);
+        clang_getSpellingLocation(right_start, &mut file, std::ptr::null_mut(), std::ptr::null_mut(), &mut roff);
+        for tok in tokens.iter() {
+            if clang_getTokenKind(*tok) != CXToken_Punctuation { continue; }
+            let tloc = clang_getTokenLocation(tu, *tok);
+            let mut toff = 0u32;
+            clang_getSpellingLocation(tloc, &mut file, std::ptr::null_mut(), std::ptr::null_mut(), &mut toff);
+            if (loff == 0 || toff >= loff) && (roff == 0 || toff < roff) {
+                let sp = cx_string(clang_getTokenSpelling(tu, *tok));
+                match sp.as_str() {
+                    "(" | ")" | "[" | "]" | "." | "->" | ";" | "{" | "}" | "," => continue,
+                    _ => { result = sp; break; }
+                }
             }
-            result = sp;
-            break;
         }
     }
 
     clang_disposeTokens(tu, toks, n);
-    result
+    if result.is_empty() { "+".to_string() } else { result }
 }
-
 fn str_to_binop(s: &str) -> BinOp {
     match s {
         "+"  => BinOp::Add,
@@ -813,12 +841,27 @@ unsafe fn extract_unary(cursor: clang_sys::CXCursor) -> Option<CExpression> {
     let mut is_prefix = true;
     if !toks.is_null() && n > 0 {
         let tokens = std::slice::from_raw_parts(toks, n as usize);
+        // Check first token for a prefix operator
         if clang_getTokenKind(tokens[0]) == CXToken_Punctuation {
-            op_str = cx_string(clang_getTokenSpelling(tu, tokens[0]));
-            is_prefix = true;
-        } else if n >= 2 && clang_getTokenKind(tokens[n as usize - 1]) == CXToken_Punctuation {
-            op_str = cx_string(clang_getTokenSpelling(tu, tokens[n as usize - 1]));
-            is_prefix = false;
+            let sp = cx_string(clang_getTokenSpelling(tu, tokens[0]));
+            match sp.as_str() {
+                "-" | "!" | "*" | "&" | "~" | "++" | "--" => {
+                    op_str = sp; is_prefix = true;
+                }
+                _ => {}
+            }
+        }
+        // Postfix: scan all tokens for ++ or -- (last token may be ')' or ';'
+        // if the cursor range extends past the operator)
+        if op_str.is_empty() {
+            for (k, &tok) in tokens.iter().enumerate() {
+                if clang_getTokenKind(tok) == CXToken_Punctuation {
+                    let sp = cx_string(clang_getTokenSpelling(tu, tok));
+                    if sp == "++" || sp == "--" {
+                        op_str = sp; is_prefix = k == 0; break;
+                    }
+                }
+            }
         }
         clang_disposeTokens(tu, toks, n);
     }

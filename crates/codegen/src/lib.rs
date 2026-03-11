@@ -201,8 +201,21 @@ impl FunctionTranslator {
         if func.is_main {
             out.push_str("fn main() {\n");
         } else {
+            // ── Lifetime annotation analysis ───────────────────────────────────
+            // If the function returns a reference type (&T, &[T], &mut T) and
+            // has reference parameters, we must add lifetime annotations so that
+            // Rust can verify borrow validity.  We use a single lifetime `'a`
+            // assigned to all reference params and the return type.
+            let ret_is_ref = func.rust_return_type.starts_with('&');
+            let ref_params: Vec<usize> = func.parameters.iter().enumerate()
+                .filter(|(_, p)| p.rust_type.starts_with('&'))
+                .map(|(i, _)| i)
+                .collect();
+            let needs_lifetime = ret_is_ref && !ref_params.is_empty();
+
             out.push_str("pub fn ");
             out.push_str(&func.name);
+            if needs_lifetime { out.push_str("<'a>"); }
             out.push('(');
             for (i, param) in func.parameters.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
@@ -211,12 +224,23 @@ impl FunctionTranslator {
                 }
                 out.push_str(&param.name);
                 out.push_str(": ");
-                out.push_str(&param.rust_type);
+                // Add 'a lifetime to reference parameters
+                let ty = if needs_lifetime && ref_params.contains(&i) {
+                    annotate_lifetime(&param.rust_type, "'a")
+                } else {
+                    param.rust_type.clone()
+                };
+                out.push_str(&ty);
             }
             out.push(')');
             if func.rust_return_type != "()" {
                 out.push_str(" -> ");
-                out.push_str(&func.rust_return_type);
+                let ret_ty = if needs_lifetime {
+                    annotate_lifetime(&func.rust_return_type, "'a")
+                } else {
+                    func.rust_return_type.clone()
+                };
+                out.push_str(&ret_ty);
             }
             out.push_str(" {\n");
         }
@@ -338,7 +362,7 @@ impl FunctionTranslator {
             }
 
             IrStatement::While { condition, body } => {
-                let mut s = format!("{}while {} {{\n", ind, ExprEmitter::emit(condition)?);
+                let mut s = format!("{}while {} {{\n", ind, emit_bool_condition(condition)?);
                 for st in body { s.push_str(&Self::emit_stmt(st, depth + 1, unsafe_ctx)?); }
                 s.push_str(&format!("{}}}\n", ind));
                 s
@@ -346,11 +370,12 @@ impl FunctionTranslator {
 
             IrStatement::While2 { init, condition, increment, body } => {
                 let mut s = Self::emit_stmt(init, depth, unsafe_ctx)?;
-                s.push_str(&format!("{}while {} {{\n", ind, ExprEmitter::emit(condition)?));
+                s.push_str(&format!("{}while {} {{\n", ind, emit_bool_condition(condition)?));
                 for st in body { s.push_str(&Self::emit_stmt(st, depth + 1, unsafe_ctx)?); }
                 let incr = ExprEmitter::emit(increment)?;
                 if !incr.is_empty() && incr != "()" {
-                    s.push_str(&format!("{}{};  \n", ind1, incr));
+                    s.push_str(&format!("{}{};
+", ind1, incr));
                 }
                 s.push_str(&format!("{}}}\n", ind));
                 s
@@ -386,11 +411,15 @@ impl FunctionTranslator {
                 for st in body {
                     s.push_str(&Self::emit_stmt(st, depth + 1, unsafe_ctx)?);
                 }
-                // Skip break condition for infinite loops: while(1) or while(true)
-                let is_infinite = matches!(condition,
-                    IrExpr::IntLit(1) | IrExpr::BoolLit(true));
+                // Skip break condition for infinite loops: while(1)/while(true)/while(2)
+                let is_infinite = match condition {
+                    IrExpr::IntLit(n)  => *n != 0,
+                    IrExpr::BoolLit(b) => *b,
+                    _ => false,
+                };
                 if !is_infinite {
-                    s.push_str(&format!("{}if !({}) {{ break; }}\n", ind1, ExprEmitter::emit(condition)?));
+                    let cond_str = emit_bool_condition(condition)?;
+                    s.push_str(&format!("{}if !({}) {{ break; }}\n", ind1, cond_str));
                 }
                 s.push_str(&format!("{}}}\n", ind));
                 s
@@ -535,8 +564,8 @@ impl ExprEmitter {
             }
 
             IrExpr::Deref(inner)  => format!("(*{})", Self::emit(inner)?),
-            IrExpr::Ref(inner)    => format!("(&{})", Self::emit(inner)?),
-            IrExpr::RefMut(inner) => format!("(&mut {})", Self::emit(inner)?),
+            IrExpr::Ref(inner)    => format!("&{}", Self::emit(inner)?),
+            IrExpr::RefMut(inner) => format!("&mut {}", Self::emit(inner)?),
             IrExpr::Clone(inner)  => format!("{}.clone()", Self::emit(inner)?),
 
             IrExpr::PrintLn { fmt, args } => {
@@ -583,6 +612,28 @@ impl ExprEmitter {
             _ => false,
         };
         if needs_parens { Ok(format!("({})", s)) } else { Ok(s) }
+    }
+}
+
+/// Emit a condition expression, coercing C integer booleans to Rust bool.
+/// In C, `while(1)` means infinite loop and `while(0)` means never.
+fn emit_bool_condition(expr: &IrExpr) -> anyhow::Result<String> {
+    match expr {
+        IrExpr::IntLit(0) => Ok("false".to_string()),
+        IrExpr::IntLit(_) => Ok("true".to_string()),
+        _ => ExprEmitter::emit(expr),
+    }
+}
+
+/// Insert a lifetime annotation into a reference type string.
+/// e.g. `&str` → `&'a str`, `&mut [i32]` → `&'a mut [i32]`, `&T` → `&'a T`
+fn annotate_lifetime(ty: &str, lt: &str) -> String {
+    if let Some(rest) = ty.strip_prefix("&mut ") {
+        format!("&{} mut {}", lt, rest)
+    } else if let Some(rest) = ty.strip_prefix('&') {
+        format!("&{} {}", lt, rest)
+    } else {
+        ty.to_string()
     }
 }
 

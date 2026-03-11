@@ -368,16 +368,34 @@ fn translate_file(
         if single { println!("     ⚠  Validation skipped (--no-validate)"); }
         let raw = std::fs::read_to_string(input).context("Failed to read input file")?;
         input_validation::ValidatedSource {
-            source: raw, file_path: input.to_string_lossy().to_string(),
-            line_count: 0, features: vec![], warnings: vec![],
+            source: raw,
+            file_path: input.to_string_lossy().to_string(),
+            line_count: 0,
+            features: vec![],
+            diagnostics: vec![],
+            complexity: 0,
+            defines: std::collections::HashMap::new(),
+            warnings: vec![],
         }
     } else {
         match validator.validate_file(input) {
             Ok(v) => {
                 if single {
-                    println!("     ✓ Validation passed ({} lines, {} features detected)",
-                        v.line_count, v.features.len());
-                    for w in &v.warnings { println!("       ⚠  {}", w); }
+                    let errors_n   = v.diagnostics.iter().filter(|d| d.severity == input_validation::Severity::Error).count();
+                    let warnings_n = v.diagnostics.iter().filter(|d| d.severity == input_validation::Severity::Warning).count();
+                    println!("     ✓ Validation passed ({} lines, {} features, complexity {}%)",
+                        v.line_count, v.features.len(), v.complexity);
+                    if errors_n > 0 || warnings_n > 0 {
+                        println!("       {} error(s), {} warning(s):", errors_n, warnings_n);
+                    }
+                    for d in &v.diagnostics {
+                        if d.severity >= input_validation::Severity::Warning {
+                            let prefix = if d.severity == input_validation::Severity::Error { "✗" } else { "⚠" };
+                            let loc = if d.line > 0 { format!(" L{}", d.line) } else { String::new() };
+                            println!("       {} {}{}: {}", prefix, d.severity, loc, d.message);
+                            if !d.hint.is_empty() { println!("          → {}", d.hint); }
+                        }
+                    }
                 }
                 v
             }

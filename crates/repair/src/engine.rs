@@ -26,6 +26,14 @@ impl RepairEngine {
         let (r, c) = Self::repair_compound_assignments(&current);
         if c { current = r; actions.push(action("CompoundAssign", "Replaced x = x OP expr with x OP= expr")); }
 
+        // Proactively strip imports that are only needed when certain features are used.
+        // This avoids unused-import warnings even before the first compiler run.
+        let (r, c) = Self::strip_unused_io_import(&current);
+        if c { current = r; actions.push(action("StripUnusedIo", "Removed std::io import (no print! calls)")); }
+
+        let (r, c) = Self::strip_unused_ptr_import(&current);
+        if c { current = r; actions.push(action("StripUnusedPtr", "Removed std::ptr import (no raw pointer operations)")); }
+
         // ── Pass 1: Structural / format fixes ─────────────────────────────────
         let (r, c) = Self::repair_print_flush_semicolon(&current);
         if c { current = r; actions.push(action("PrintFlushSemicolon", "Fixed missing semicolon between print!() and io::stdout().flush()")); }
@@ -604,26 +612,70 @@ impl RepairEngine {
     }
 
     fn repair_unused_import(code: &str, msg: &str) -> (String, bool) {
-        let re = Regex::new(r"unused import: `([^`]+)`").unwrap();
-        if let Some(cap) = re.captures(msg) {
-            let import = &cap[1];
-            let use_re = Regex::new(r"use [^;]+;").unwrap();
-            for m in use_re.find_iter(code) {
+        // Collect all unused import names from the diagnostic message.
+        // Handles: "unused import: `name`" and "unused imports: `A` and `B`"
+        let item_re = Regex::new(r"`([^`]+)`").unwrap();
+        let unused: Vec<String> = item_re.captures_iter(msg)
+            .map(|c| c[1].to_string())
+            .collect();
+        if unused.is_empty() { return (code.to_string(), false); }
+
+        let mut result = code.to_string();
+        let mut changed = false;
+        let use_line_re = Regex::new(r"use [^;]+;").unwrap();
+
+        for item in &unused {
+            let snapshot = result.clone();
+            for m in use_line_re.find_iter(&snapshot) {
                 let stmt = m.as_str();
-                if stmt.contains(import) {
-                    let new_stmt = stmt.replace(&format!(", {}", import), "")
-                                      .replace(&format!("{}, ", import), "")
-                                      .replace(import, "");
-                    if new_stmt.contains("use ;") || new_stmt.trim() == "use ;" {
-                        let result = code.replace(&format!("{}\n", stmt), "");
-                        if result != code { return (result, true); }
+                if !stmt.contains(item.as_str()) { continue; }
+
+                // Case 1: full-path import `use std::ptr;` — remove entire line
+                if !stmt.contains('{') {
+                    let removed = result.replace(&format!("{}\n", stmt), "");
+                    if removed != result { result = removed; changed = true; break; }
+                    let removed = result.replace(stmt, "");
+                    if removed != result { result = removed; changed = true; break; }
+                }
+
+                // Case 2: grouped `use std::io::{self, Write};` — remove item from braces
+                if stmt.contains('{') && stmt.contains('}') {
+                    let trimmed = item.trim();
+                    let new_stmt = stmt
+                        .replace(&format!(", {}", trimmed), "")
+                        .replace(&format!("{}, ", trimmed), "")
+                        .replace(trimmed, "");
+
+                    // If only empty braces remain → remove whole line
+                    let empty_re = Regex::new(r"\{\s*\}").unwrap();
+                    if empty_re.is_match(&new_stmt) {
+                        let removed = result.replace(&format!("{}\n", stmt), "");
+                        if removed != result { result = removed; changed = true; break; }
+                        let removed = result.replace(stmt, "");
+                        if removed != result { result = removed; changed = true; break; }
                     }
-                    let result = code.replace(stmt, &new_stmt);
-                    if result != code { return (result, true); }
+
+                    // Clean stray leading/trailing commas: `{, Write}` → `{Write}`
+                    let clean_re  = Regex::new(r"\{\s*,\s*").unwrap();
+                    let new_stmt  = clean_re.replace_all(&new_stmt, "{").to_string();
+                    let clean_re2 = Regex::new(r",\s*\}").unwrap();
+                    let new_stmt  = clean_re2.replace_all(&new_stmt, "}").to_string();
+
+                    if new_stmt != stmt {
+                        result = result.replace(stmt, &new_stmt);
+                        changed = true;
+                        break;
+                    }
                 }
             }
         }
-        (code.to_string(), false)
+
+        // Final sweep: remove any `use path::{};` lines left over
+        let empty_use_re = Regex::new(r"use [^;]*\{\s*\}\s*;\n?").unwrap();
+        let cleaned = empty_use_re.replace_all(&result, "").to_string();
+        if cleaned != result { result = cleaned; changed = true; }
+
+        (result, changed)
     }
 
     fn repair_lifetime_annotation(code: &str, _diag: &RustcDiagnostic) -> (String, bool) {
@@ -729,6 +781,46 @@ impl RepairEngine {
         if new_line != line {
             lines[line_no - 1] = new_line;
             return (lines.join("\n"), true);
+        }
+        (code.to_string(), false)
+    }
+
+    /// Remove `use std::io::{self, Write};` when the code has no `print!` calls
+    /// (only `println!` which doesn't need flush, or no IO at all).
+    fn strip_unused_io_import(code: &str) -> (String, bool) {
+        if !code.contains("use std::io") { return (code.to_string(), false); }
+        // io::stdout().flush() is only needed alongside print! (not println!)
+        let has_print_flush = code.contains("io::stdout().flush()")
+            || code.contains("io::stderr().flush()");
+        if !has_print_flush {
+            let result = Regex::new(r"use std::io::\{[^}]*\};\n?").unwrap()
+                .replace_all(code, "")
+                .to_string();
+            // Also handle bare `use std::io;`
+            let result = Regex::new(r"use std::io;\n?").unwrap()
+                .replace_all(&result, "")
+                .to_string();
+            if result != code { return (result, true); }
+        }
+        (code.to_string(), false)
+    }
+
+    /// Remove `use std::ptr;` when the code has no raw pointer operations (`*mut`, `*const`).
+    fn strip_unused_ptr_import(code: &str) -> (String, bool) {
+        if !code.contains("use std::ptr") { return (code.to_string(), false); }
+        // Check for raw pointer usage outside of import lines
+        let code_no_uses: String = code.lines()
+            .filter(|l| !l.trim_start().starts_with("use "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let has_raw_ptr = code_no_uses.contains("*mut ")
+            || code_no_uses.contains("*const ")
+            || code_no_uses.contains("std::ptr::");
+        if !has_raw_ptr {
+            let result = Regex::new(r"use std::ptr(?:::[^;]*)?\s*;\n?").unwrap()
+                .replace_all(code, "")
+                .to_string();
+            if result != code { return (result, true); }
         }
         (code.to_string(), false)
     }

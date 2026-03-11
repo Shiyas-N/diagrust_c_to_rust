@@ -40,6 +40,7 @@ impl NoWindow for Command {
 struct TranslationResult {
     rust_code: String,
     report_text: String,
+    validation_report: String,   // validation panel content
     error: Option<String>,
     c_output: Option<String>,
     rust_output: Option<String>,
@@ -50,7 +51,7 @@ struct TranslationResult {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { Output, Report }
+enum Tab { Output, Report, Validation }
 
 struct DiagRustApp {
     // Editor
@@ -61,6 +62,8 @@ struct DiagRustApp {
     translating: bool,
     running_c: bool,
     running_rust: bool,
+    validating: bool,
+    strict_validate: bool,
     active_tab: Tab,
     // Status bar
     status: String,
@@ -78,6 +81,8 @@ impl Default for DiagRustApp {
             translating: false,
             running_c: false,
             running_rust: false,
+            validating: false,
+            strict_validate: false,
             active_tab: Tab::Output,
             status: "Ready".to_string(),
             save_path: "output.rs".to_string(),
@@ -95,6 +100,113 @@ fn translate_in_thread(c_source: String, max_iter: usize, result_slot: Arc<Mutex
         let res = do_translate(&c_source, max_iter);
         *result_slot.lock().unwrap() = Some(res);
     });
+}
+
+/// Run C validation in a background thread, writing result into `validation_report`.
+fn validate_c_in_thread(c_source: String, strict: bool, result_slot: Arc<Mutex<Option<TranslationResult>>>) {
+    thread::spawn(move || {
+        let report = do_validate_c(&c_source, strict);
+        // Merge into existing result, or create a stub if none exists yet
+        let mut guard = result_slot.lock().unwrap();
+        if let Some(ref mut res) = *guard {
+            res.validation_report = report;
+        } else {
+            *guard = Some(TranslationResult {
+                validation_report: report,
+                ..Default::default()
+            });
+        }
+    });
+}
+
+fn do_validate_c(c_source: &str, strict: bool) -> String {
+
+    let validator = input_validation::InputValidator::new(strict);
+    match validator.validate_source(c_source, "input.c") {
+        Ok(result) => format_validation_report(&result),
+        Err(e)     => format!("Validation error: {}\n", e),
+    }
+}
+
+fn format_validation_report(result: &input_validation::ValidatedSource) -> String {
+    use input_validation::Severity;
+
+    let mut buf = String::new();
+    buf.push_str("═══════════════════════════════════════════════════\n");
+    buf.push_str("          DIAGRUST C VALIDATION REPORT\n");
+    buf.push_str("═══════════════════════════════════════════════════\n\n");
+
+    let errors   = result.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
+    let warnings = result.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+    let infos    = result.diagnostics.iter().filter(|d| d.severity == Severity::Info).count();
+
+    let status = if errors > 0 {
+        format!("✗  {} error(s) — fix before transpiling", errors)
+    } else if warnings > 0 {
+        format!("⚠  {} warning(s) — may affect output", warnings)
+    } else {
+        "✅  C source looks good — ready to transpile".to_string()
+    };
+
+    buf.push_str(&format!("Status:      {}\n", status));
+    buf.push_str(&format!("Lines:       {}\n", result.line_count));
+    buf.push_str(&format!("Complexity:  {}/100\n", result.complexity));
+    buf.push_str(&format!("Errors:      {}  |  Warnings: {}  |  Info: {}\n\n", errors, warnings, infos));
+
+    if !result.diagnostics.is_empty() {
+        buf.push_str("───────────────────────────────────────────────────\n");
+        buf.push_str("DIAGNOSTICS\n");
+        buf.push_str("───────────────────────────────────────────────────\n");
+
+        for d in &result.diagnostics {
+            let icon = match d.severity {
+                Severity::Error   => "✗ ERROR  ",
+                Severity::Warning => "⚠ WARN   ",
+                Severity::Info    => "ℹ INFO   ",
+            };
+            let line_str = if d.line > 0 { format!("line {:3} │ ", d.line) } else { "         │ ".to_string() };
+            buf.push_str(&format!("  {}{}  {}\n", icon, line_str, d.message));
+            if let Some(ref ctx) = d.context {
+                buf.push_str(&format!("              │   ╰─ {}\n", ctx));
+            }
+            if !d.hint.is_empty() {
+                buf.push_str(&format!("              │   💡 {}\n", d.hint));
+            }
+        }
+    }
+
+    if !result.features.is_empty() {
+        buf.push_str("\n───────────────────────────────────────────────────\n");
+        buf.push_str("FEATURES DETECTED\n");
+        buf.push_str("───────────────────────────────────────────────────\n");
+        let feat_list: Vec<_> = result.features.iter().collect();
+        let row_count = (feat_list.len() + 2) / 3;
+        for row in 0..row_count {
+            let mut line_s = String::from("  ");
+            for col in 0..3 {
+                if let Some(f) = feat_list.get(row + col * row_count) {
+                    line_s.push_str(&format!("  {:20}", f));
+                }
+            }
+            buf.push_str(&line_s.trim_end());
+            buf.push('\n');
+        }
+    }
+
+    if !result.defines.is_empty() {
+        buf.push_str("\n───────────────────────────────────────────────────\n");
+        buf.push_str("PREPROCESSOR DEFINES\n");
+        buf.push_str("───────────────────────────────────────────────────\n");
+        for (k, v) in &result.defines {
+            if v.is_empty() {
+                buf.push_str(&format!("  #define {}\n", k));
+            } else {
+                buf.push_str(&format!("  #define {} = {}\n", k, v));
+            }
+        }
+    }
+
+    buf
 }
 
 fn do_translate(c_source: &str, max_iter: usize) -> TranslationResult {
@@ -335,6 +447,18 @@ impl eframe::App for DiagRustApp {
             }
         }
 
+        // Poll validation thread
+        if self.validating {
+            if let Ok(guard) = self.result.try_lock() {
+                if guard.as_ref().map(|r| !r.validation_report.is_empty()).unwrap_or(false) {
+                    self.validating = false;
+                    self.status = "Validation complete".to_string();
+                    ctx.request_repaint();
+                }
+                drop(guard);
+            }
+        }
+
         // ── Top toolbar ─────────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -353,6 +477,26 @@ impl eframe::App for DiagRustApp {
                     *self.result.lock().unwrap() = None;
                     translate_in_thread(self.c_source.clone(), self.max_iter, Arc::clone(&self.result));
                 }
+
+                ui.separator();
+
+                // Validate C button
+                let validate_label = if self.validating { "⏳ Validating…" } else { "🔍 Validate C" };
+                if ui.add_enabled(!self.validating && !self.translating, egui::Button::new(validate_label))
+                    .on_hover_text("Check C source for errors and warnings before transpiling")
+                    .clicked()
+                {
+                    self.validating = true;
+                    self.status = "Validating C source…".to_string();
+                    // Clear previous validation report
+                    if let Ok(mut g) = self.result.try_lock() {
+                        if let Some(ref mut r) = *g { r.validation_report.clear(); }
+                    }
+                    validate_c_in_thread(self.c_source.clone(), self.strict_validate, Arc::clone(&self.result));
+                    self.active_tab = Tab::Validation;
+                }
+                ui.checkbox(&mut self.strict_validate, "Strict")
+                    .on_hover_text("Enable strict C validation (type mismatches, dangerous patterns)");
 
                 ui.separator();
 
@@ -415,11 +559,15 @@ impl eframe::App for DiagRustApp {
             });
         });
 
-        // ── Bottom panel: Output / Report tabs ───────────────────────────────
+        // ── Bottom panel: Output / Report / Validation tabs ──────────────────
         egui::TopBottomPanel::bottom("bottom_panel").resizable(true).min_height(120.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Output, "📺 Run Output");
                 ui.selectable_value(&mut self.active_tab, Tab::Report, "📋 Translation Report");
+                ui.selectable_value(&mut self.active_tab, Tab::Validation, "🔍 C Validation");
+                if self.validating {
+                    ui.spinner();
+                }
             });
             ui.separator();
 
@@ -461,6 +609,28 @@ impl eframe::App for DiagRustApp {
                         else { res.report_text.clone() }
                     } else {
                         "Translate first to see the report.".to_string()
+                    };
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut text.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                        );
+                    });
+                }
+                Tab::Validation => {
+                    let text = if self.validating {
+                        "⏳ Running C validation (gcc -fsyntax-only)…".to_string()
+                    } else if let Some(res) = &*guard {
+                        if res.validation_report.is_empty() {
+                            "Press 🔍 Validate C in the toolbar to check your C source.\n\
+                             Validation runs gcc/clang -fsyntax-only plus static analysis.".to_string()
+                        } else {
+                            res.validation_report.clone()
+                        }
+                    } else {
+                        "Press 🔍 Validate C in the toolbar to check your C source.\n\
+                         Validation runs gcc/clang -fsyntax-only plus static analysis.".to_string()
                     };
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.add(

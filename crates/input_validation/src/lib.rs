@@ -192,7 +192,11 @@ impl InputValidator {
         let features   = self.detect_features(&source);
         let complexity = self.estimate_complexity(&source);
 
-        // Legacy warnings vec
+        // Step 10: Run gcc/clang -fsyntax-only for real C error detection
+        let mut compiler_diags = Self::validate_with_compiler(raw);
+        diags.append(&mut compiler_diags);
+
+        // Legacy warnings vec (backward compat)
         let warnings: Vec<String> = diags.iter()
             .filter(|d| d.severity >= Severity::Warning)
             .map(|d| format!("[{}] line {}: {}", d.severity, d.line, d.message))
@@ -207,7 +211,16 @@ impl InputValidator {
             }
         }
 
-        Ok(ValidatedSource { source, file_path: file_name.to_string(), line_count, features, diagnostics: diags, complexity, defines, warnings })
+        Ok(ValidatedSource {
+            source,
+            file_path: file_name.to_string(),
+            line_count,
+            features,
+            diagnostics: diags,
+            complexity,
+            defines,
+            warnings,
+        })
     }
 
     // ── Comment stripping ─────────────────────────────────────────────────────
@@ -568,6 +581,102 @@ impl InputValidator {
             }
         }
         max
+    }
+
+    // ── Compiler-based C validation ───────────────────────────────────────────
+
+    /// Run `gcc -fsyntax-only` (or `clang`) on the source to catch real C errors.
+    /// Returns a list of Diagnostics parsed from the compiler output.
+    /// If no compiler is available, returns an empty list (non-blocking).
+    fn validate_with_compiler(source: &str) -> Vec<Diagnostic> {
+        use std::process::Command;
+
+        // Write source to a temp file
+        let tmp_path = {
+            let mut p = std::env::temp_dir();
+            p.push(format!("diagrust_validate_{}.c", std::process::id()));
+            p
+        };
+        if std::fs::write(&tmp_path, source).is_err() {
+            return vec![];
+        }
+
+        // Try compilers in order
+        let compilers = ["gcc", "clang", "cc", "cl"];
+        let mut output_text = String::new();
+        let mut compiler_found = false;
+
+        for compiler in &compilers {
+            let res = Command::new(compiler)
+                .args(["-fsyntax-only", "-Wall", "-Wextra",
+                       "-Wno-unused-variable", "-Wno-unused-parameter",
+                       tmp_path.to_str().unwrap_or("")])
+                .output();
+
+            if let Ok(out) = res {
+                output_text = String::from_utf8_lossy(&out.stderr).to_string();
+                compiler_found = true;
+                break;
+            }
+        }
+
+        let _ = std::fs::remove_file(&tmp_path);
+
+        if !compiler_found {
+            return vec![Diagnostic::info(0, "No C compiler found (gcc/clang) — skipping C syntax check")];
+        }
+
+        if output_text.trim().is_empty() {
+            return vec![Diagnostic::info(0, "C compiler check: no errors found ✓")];
+        }
+
+        // Parse compiler output lines: "file.c:LINE:COL: error|warning|note: MESSAGE"
+        let diag_re = Regex::new(r"[^:]+:(\d+):\d+:\s+(error|warning|note):\s+(.+)").unwrap();
+        let mut diags = Vec::new();
+        let mut seen_errors = 0;
+        let mut seen_warnings = 0;
+
+        for line in output_text.lines() {
+            if let Some(cap) = diag_re.captures(line) {
+                let line_no: usize = cap[1].parse().unwrap_or(0);
+                let level = &cap[2];
+                let msg = cap[3].trim().to_string();
+
+                // Skip overly verbose notes and generic "aborting" messages
+                if msg.starts_with("In file included") || msg.contains("error generated") {
+                    continue;
+                }
+
+                match level {
+                    "error" => {
+                        seen_errors += 1;
+                        if seen_errors <= 20 { // Cap at 20 errors
+                            diags.push(Diagnostic::error(line_no,
+                                format!("[C compiler] {}", msg),
+                                "Fix this C-level error before transpiling"));
+                        }
+                    }
+                    "warning" => {
+                        seen_warnings += 1;
+                        if seen_warnings <= 10 {
+                            diags.push(Diagnostic::warning(line_no,
+                                format!("[C compiler] {}", msg),
+                                "This warning may cause issues in the transpiled Rust code"));
+                        }
+                    }
+                    _ => {} // skip notes
+                }
+            }
+        }
+
+        if diags.is_empty() && !output_text.trim().is_empty() {
+            // Compiler had output but we couldn't parse it — surface it raw
+            diags.push(Diagnostic::warning(0,
+                format!("C compiler output: {}", output_text.lines().next().unwrap_or("").trim()),
+                "Check the C source manually"));
+        }
+
+        diags
     }
 }
 

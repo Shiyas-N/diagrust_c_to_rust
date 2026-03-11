@@ -20,3 +20,5 @@ ir            = { path = "../ir" }
 codegen       = { path = "../codegen" }
 compiler_loop = { path = "../compiler_loop" }
 reporting     = { path = "../reporting" }
+input_validation = { path = "../input_validation" }
+rfd           = { version = "0.14", optional = true }

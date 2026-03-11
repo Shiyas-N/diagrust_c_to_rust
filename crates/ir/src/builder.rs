@@ -29,6 +29,17 @@ impl IrBuilder {
 
         let fn_param_types: HashMap<String, Vec<String>> = program.functions.iter().map(|f| {
             let array_params = Self::detect_array_params(f);
+            // Check if this function returns *mut T (will be upgraded to &mut T)
+            let ret_raw = Self::fallback_type(&f.return_type);
+            let return_inner = if ret_raw.starts_with("*mut ") {
+                let inner = ret_raw["*mut ".len()..].to_string();
+                // Only upgrade if at least one param is *mut T of the same inner type
+                let has_ptr_param = f.parameters.iter().any(|p| {
+                    Self::fallback_type(&p.param_type) == format!("*mut {}", inner)
+                });
+                if has_ptr_param { Some(inner) } else { None }
+            } else { None };
+
             let types: Vec<String> = f.parameters.iter().map(|p| {
                 if array_params.contains(&p.name) {
                     let inner = match &p.param_type {
@@ -37,7 +48,14 @@ impl IrBuilder {
                     };
                     format!("&mut [{}]", inner)
                 } else {
-                    Self::fallback_type(&p.param_type)
+                    let base = Self::fallback_type(&p.param_type);
+                    // Upgrade *mut T → &mut T for pointer-return functions
+                    if let Some(ref inner) = return_inner {
+                        if base == format!("*mut {}", inner) {
+                            return format!("&mut {}", inner);
+                        }
+                    }
+                    base
                 }
             }).collect();
             (f.name.clone(), types)
@@ -59,8 +77,14 @@ impl IrBuilder {
             IrGlobalVar { name: gv.name.clone(), rust_type, init, is_const: gv.is_const }
         }).collect();
 
-        if program.has_main {
+        // Smart import injection: only add what the generated IR actually uses.
+        // std::io::{self, Write} is only needed when print! (with flush) is emitted.
+        // std::ptr is only needed when raw pointer operations appear.
+        if Self::ir_uses_print_flush(&functions) {
             required_uses.insert("std::io::{self, Write}".to_string());
+        }
+        if Self::ir_uses_raw_ptr(&functions) {
+            required_uses.insert("std::ptr".to_string());
         }
 
         let structs = program.structs.iter().map(|sd| IrStructDef {
@@ -188,6 +212,13 @@ impl IrBuilder {
         let parameters: Vec<IrParameter> = if is_main {
             vec![]
         } else {
+            // Pre-check: if return type is `*mut T` and we have `*mut T` pointer params,
+            // we will upgrade return to `&mut T`.  In that case, also upgrade the params.
+            let ret_raw = Self::fallback_type(&func.return_type);
+            let return_inner = if ret_raw.starts_with("*mut ") {
+                Some(ret_raw["*mut ".len()..].to_string())
+            } else { None };
+
             func.parameters.iter().map(|p| {
                 let rt = if array_params.contains(&p.name) {
                     let inner = match &p.param_type {
@@ -196,9 +227,21 @@ impl IrBuilder {
                     };
                     format!("&mut [{}]", inner)
                 } else {
-                    sem.rust_type_map.get(&p.name)
+                    let base_rt = sem.rust_type_map.get(&p.name)
                         .map(|r| r.rust_repr.clone())
-                        .unwrap_or_else(|| Self::fallback_type(&p.param_type))
+                        .unwrap_or_else(|| Self::fallback_type(&p.param_type));
+
+                    // Upgrade *mut T → &mut T when the function returns a reference
+                    // to one of its pointer parameters (same inner type).
+                    if let Some(ref inner) = return_inner {
+                        if base_rt == format!("*mut {}", inner) {
+                            format!("&mut {}", inner)
+                        } else {
+                            base_rt
+                        }
+                    } else {
+                        base_rt
+                    }
                 };
                 let ownership = sem.ownership_map.get(&p.name).cloned().unwrap_or(OwnershipKind::Value);
                 let is_mut = array_params.contains(&p.name) || sem.mutable_vars.contains(&p.name);
@@ -215,7 +258,28 @@ impl IrBuilder {
             uses.insert("std::cell::RefCell".to_string());
         }
 
-        let rust_return_type = if is_main { "()".to_string() } else { Self::fallback_type(&func.return_type) };
+        let rust_return_type = if is_main {
+            "()".to_string()
+        } else {
+            // If the function returns a pointer (`*mut T`) and has pointer/mut-ref params
+            // of the same inner type, translate the return to `&mut T` so that Rust
+            // lifetime rules apply cleanly (codegen will add `<'a>` annotations).
+            let raw_ret = Self::fallback_type(&func.return_type);
+            if raw_ret.starts_with("*mut ") {
+                let inner = &raw_ret["*mut ".len()..];
+                let any_ref_param = func.parameters.iter().any(|p| {
+                    let pt = Self::fallback_type(&p.param_type);
+                    pt == format!("*mut {}", inner) || pt == format!("&mut {}", inner)
+                });
+                if any_ref_param {
+                    format!("&mut {}", inner)
+                } else {
+                    raw_ret
+                }
+            } else {
+                raw_ret
+            }
+        };
 
         let raw_body = Self::build_stmts(&func.body, sem, struct_fields, fn_param_types)?;
         let raw_body = if is_main { Self::strip_main_return(raw_body) } else { raw_body };
@@ -977,12 +1041,59 @@ impl IrBuilder {
         (left, right)
     }
 
-    fn coerce_arg(arg: IrExpr, param_type: &str, _sem: &semantic::FunctionSemantics) -> IrExpr {
+    // ── IO usage detection ───────────────────────────────────────────────────
+    /// Returns true if any function uses `Print` (i.e. needs io::stdout().flush())
+    fn ir_uses_print_flush(functions: &[IrFunction]) -> bool {
+        functions.iter().any(|f| Self::stmts_use_print(&f.body))
+    }
+
+    fn stmts_use_print(stmts: &[IrStatement]) -> bool {
+        stmts.iter().any(|s| match s {
+            IrStatement::Expr(IrExpr::Print { .. })
+            | IrStatement::Expr(IrExpr::EPrintLn { .. }) => true,
+            IrStatement::If { then_block, else_block, .. } =>
+                Self::stmts_use_print(then_block)
+                || else_block.as_ref().map(|e| Self::stmts_use_print(e)).unwrap_or(false),
+            IrStatement::While { body, .. }
+            | IrStatement::Loop { body, .. } => Self::stmts_use_print(body),
+            IrStatement::While2 { body, .. } => Self::stmts_use_print(body),
+            _ => false,
+        })
+    }
+
+    /// Returns true if any function uses raw pointer types (needs `use std::ptr`)
+    fn ir_uses_raw_ptr(functions: &[IrFunction]) -> bool {
+        functions.iter().any(|f| {
+            f.parameters.iter().any(|p| p.rust_type.contains("*mut") || p.rust_type.contains("*const"))
+            || f.rust_return_type.contains("*mut")
+            || f.rust_return_type.contains("*const")
+        })
+    }
+
+    fn coerce_arg(arg: IrExpr, param_type: &str, sem: &semantic::FunctionSemantics) -> IrExpr {
         if param_type.starts_with("&mut [") {
             match &arg {
-                IrExpr::Var(_) => return IrExpr::RefMut(Box::new(arg)),
+                IrExpr::Var(name) => {
+                    // If this var is already a &mut [T] in the current function
+                    // (it IS the mutable slice param), do NOT wrap in another &mut —
+                    // that causes E0596. Rust handles implicit reborrow automatically.
+                    let already_mut_slice = sem.rust_type_map
+                        .get(name)
+                        .map(|rt| rt.rust_repr.starts_with("&mut ["))
+                        .unwrap_or(false);
+                    if already_mut_slice { return arg; }
+                    return IrExpr::RefMut(Box::new(arg));
+                }
                 IrExpr::ArrayAccess { .. } => return arg,
                 _ => {}
+            }
+        }
+        // Handle `&mut T` (non-slice) param: if we're passing `&x`, upgrade to `&mut x`
+        if param_type.starts_with("&mut ") && !param_type.starts_with("&mut [") {
+            match arg {
+                IrExpr::Ref(inner) => return IrExpr::RefMut(inner),
+                IrExpr::Var(ref _name) => return IrExpr::RefMut(Box::new(arg)),
+                other => return other,
             }
         }
         if param_type.starts_with("Vec<") {

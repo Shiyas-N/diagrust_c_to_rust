@@ -117,7 +117,9 @@ impl SemanticAnalyser {
         let memory_patterns = MemoryPatternAnalyser::analyse(func, &symbol_table);
 
         // 4. Ownership & lifetime inference (0.3.3)
-        let ownership_map = OwnershipInferrer::infer(func, &alias_graph, &memory_patterns);
+        // Pass def_use_chains so the inferrer can distinguish read-only pointer
+        // params (&T) from write-through pointer params (&mut T).
+        let ownership_map = OwnershipInferrer::infer(func, &alias_graph, &memory_patterns, &def_use_chains);
         let lifetime_map = LifetimeInferrer::infer(func, &def_use_chains, &symbol_table);
 
         // 5. Rust type mapping (0.3.4)

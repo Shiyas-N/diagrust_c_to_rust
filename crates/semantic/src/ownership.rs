@@ -5,6 +5,7 @@
 
 use ast_input::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use crate::alias::AliasGraph;
 use crate::alias::MemoryPattern;
 use crate::alias::StorageClass;
@@ -77,21 +78,133 @@ pub struct OwnershipInferrer;
 
 impl OwnershipInferrer {
     pub fn infer(
-        _func: &CFunction,
+        func: &CFunction,
         alias_graph: &AliasGraph,
         memory_patterns: &[MemoryPattern],
     ) -> HashMap<String, OwnershipKind> {
         let mut map: HashMap<String, OwnershipKind> = HashMap::new();
 
+        // §4.6.4: pointer parameters are &mut T only if they are actually written
+        // through in the function body.  Otherwise, classify them as &T (read-only borrow).
+        let mutated_ptr_params: HashSet<String> = func
+            .parameters
+            .iter()
+            .filter(|p| matches!(&p.param_type, CType::Pointer(_)))
+            .filter(|p| Self::is_ptr_param_mutated(&p.name, &func.body))
+            .map(|p| p.name.clone())
+            .collect();
+
         for pattern in memory_patterns {
-            let kind = Self::classify(pattern, alias_graph);
+            let kind = Self::classify(pattern, alias_graph, &mutated_ptr_params);
             map.insert(pattern.variable.clone(), kind);
         }
 
         map
     }
 
-    fn classify(pattern: &MemoryPattern, alias_graph: &AliasGraph) -> OwnershipKind {
+    // ── Mutation detection ───────────────────────────────────────────────────
+    //
+    // Returns true when the pointer parameter `name` is written *through* inside
+    // `stmts`.  We detect:
+    //   • arr[i]  = v   →  IndexedAssignment { array: name }
+    //   • s->fld  = v   →  FieldAssignment   { object: starts with name }
+    //   • name    = v   →  Assignment        { target: name }  (pointer reassign)
+    //   • *name   = v   →  Expression containing a deref-assign (conservative)
+    //   • name passed to a call (may be mutated by callee — conservative)
+    //
+    // Everything else leaves the pointer immutable → &T.
+    fn is_ptr_param_mutated(name: &str, stmts: &[CStatement]) -> bool {
+        for stmt in stmts {
+            match stmt {
+                CStatement::IndexedAssignment { array, .. } if array == name => return true,
+
+                CStatement::FieldAssignment { object, .. }
+                    if object == name || object.starts_with(&format!("{}.", name)) =>
+                {
+                    return true;
+                }
+
+                CStatement::Assignment { target, value } => {
+                    if target == name { return true; }
+                    // Deref-assign: `*name = v` shows up as an Expression in the
+                    // raw parse but also as an assign-through in some paths.
+                    if Self::expr_writes_through(name, value) { return true; }
+                }
+
+                // A bare expression statement may contain `*name = v`
+                CStatement::Expression(e) => {
+                    if Self::expr_writes_through(name, e) { return true; }
+                }
+
+                // Recurse into compound statements
+                CStatement::If { then_body, else_body, .. } => {
+                    if Self::is_ptr_param_mutated(name, then_body) { return true; }
+                    if let Some(eb) = else_body {
+                        if Self::is_ptr_param_mutated(name, eb) { return true; }
+                    }
+                }
+                CStatement::While { body, .. } | CStatement::DoWhile { body, .. } => {
+                    if Self::is_ptr_param_mutated(name, body) { return true; }
+                }
+                CStatement::For { init, body, .. } => {
+                    if Self::is_ptr_param_mutated(name, std::slice::from_ref(init.as_ref())) {
+                        return true;
+                    }
+                    if Self::is_ptr_param_mutated(name, body) { return true; }
+                }
+                CStatement::Switch { cases, default, .. } => {
+                    for (_, b) in cases {
+                        if Self::is_ptr_param_mutated(name, b) { return true; }
+                    }
+                    if let Some(d) = default {
+                        if Self::is_ptr_param_mutated(name, d) { return true; }
+                    }
+                }
+                CStatement::Return(Some(e)) => {
+                    // Returning the pointer itself isn't a mutation, but returning
+                    // a deref-assign expression would be.
+                    if Self::expr_writes_through(name, e) { return true; }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// True if expression `e` contains an assignment *through* a pointer named `name`
+    /// (e.g. `*name = v`, `name[i] = v` expressed as a BinaryOp{Assign}).
+    fn expr_writes_through(name: &str, e: &CExpression) -> bool {
+        match e {
+            CExpression::BinaryOp { left, op: BinOp::Assign, .. } => {
+                match left.as_ref() {
+                    // *name = v
+                    CExpression::UnaryOp { op: UnaryOp::Deref, operand } => {
+                        matches!(operand.as_ref(), CExpression::Variable(n) if n == name)
+                    }
+                    // name[i] = v  (array-style pointer write)
+                    CExpression::ArrayAccess { array, .. } => {
+                        matches!(array.as_ref(), CExpression::Variable(n) if n == name)
+                    }
+                    // name->field = v
+                    CExpression::FieldAccess { object, .. } => {
+                        matches!(object.as_ref(), CExpression::Variable(n) if n == name)
+                    }
+                    _ => false,
+                }
+            }
+            // Recurse into nested expressions
+            CExpression::BinaryOp { left, right, .. } => {
+                Self::expr_writes_through(name, left) || Self::expr_writes_through(name, right)
+            }
+            _ => false,
+        }
+    }
+
+    fn classify(
+        pattern: &MemoryPattern,
+        alias_graph: &AliasGraph,
+        mutated_ptr_params: &HashSet<String>,
+    ) -> OwnershipKind {
         let has_aliases = alias_graph.has_aliases(&pattern.variable);
         let addr_taken = alias_graph.address_taken.contains(&pattern.variable);
 
@@ -116,11 +229,13 @@ impl OwnershipInferrer {
                 }
             }
             StorageClass::Parameter => {
-                // In C, int *x as a parameter means the caller wants us to
-                // read AND write through the pointer — always &mut T in Rust.
-                // Only downgrade to &T if we can prove no writes through it,
-                // but we conservatively use &mut for all pointer parameters.
-                OwnershipKind::MutableBorrow
+                // §4.6.4: use &mut T only when we can prove the callee actually
+                // writes through the pointer; otherwise use &T.
+                if mutated_ptr_params.contains(&pattern.variable) {
+                    OwnershipKind::MutableBorrow
+                } else {
+                    OwnershipKind::ImmutableBorrow
+                }
             }
             StorageClass::Stack => {
                 if addr_taken && has_aliases {

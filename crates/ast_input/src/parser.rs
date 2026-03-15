@@ -667,6 +667,54 @@ pub(crate) unsafe fn extract_expr(cursor: clang_sys::CXCursor) -> Option<CExpres
                 .collect();
             Some(CExpression::StructLiteral { struct_type, fields })
         }
+        CXCursor_UnaryExprOrTypeTraitExpr => {
+            // Detect sizeof / alignof by the FIRST token only.
+            // Using full_cursor_spelling here is unreliable: in a binary expression
+            // like `sizeof(arr)/sizeof(arr[0])`, Clang may assign the left sizeof
+            // cursor an extent that covers the *entire* binary expression, so
+            // full_cursor_spelling would return "sizeof(arr)/sizeof(arr[0])" and
+            // the subsequent string parsing goes wrong.
+            //
+            // Instead we:
+            //   1. Check only the first token for "sizeof"/"alignof".
+            //   2. Ask Clang for the type of the FIRST CHILD cursor (the argument
+            //      expression).  clang_getCursorType gives us the exact C type of
+            //      that argument regardless of the parent expression context.
+            //   3. Emit CExpression::Call{sizeof, [Variable(clang_type_spelling)]}.
+            //      The IR builder's sizeof_arg_to_rust_type then converts the
+            //      Clang type spelling ("int [7]", "double", "MyStruct", …) to
+            //      the correct Rust type string.
+            let first_tok = token_spelling_of_cursor(cursor);
+            if first_tok == "sizeof" || first_tok == "alignof" {
+                let children = collect_children(cursor);
+                let type_str = if let Some(&child) = children.first() {
+                    // sizeof(expr) — get the type of the argument expression
+                    let cx_ty = clang_sys::clang_getCursorType(child);
+                    let s = type_spelling(cx_ty);
+                    // Strip leading "const "
+                    s.trim_start_matches("const ").trim().to_string()
+                } else {
+                    // sizeof(type_name) with no child cursor — extract from tokens
+                    let tok = full_cursor_spelling(cursor);
+                    tok.trim_start_matches("alignof")
+                       .trim_start_matches("sizeof")
+                       .trim()
+                       .trim_matches(|c: char| c == '(' || c == ')')
+                       .trim()
+                       .to_string()
+                };
+                if !type_str.is_empty() {
+                    Some(CExpression::Call {
+                        function: "sizeof".to_string(),
+                        args: vec![CExpression::Variable(type_str)],
+                    })
+                } else {
+                    Some(CExpression::Literal(CLiteral::Int(0)))
+                }
+            } else {
+                first_child_expr(cursor)
+            }
+        }
         other => {
             if other == 617 {
                 Some(CExpression::Literal(CLiteral::Int(0)))
@@ -923,6 +971,29 @@ unsafe fn token_spelling_of_cursor(cursor: clang_sys::CXCursor) -> String {
         let s = cx_string(clang_getTokenSpelling(tu, tokens[0]));
         clang_disposeTokens(tu, toks, n);
         s
+    } else {
+        String::new()
+    };
+    result
+}
+
+/// Join ALL tokens of `cursor` into a single string.
+/// Used for sizeof/alignof where we need the full `sizeof(SomeType)` text.
+unsafe fn full_cursor_spelling(cursor: clang_sys::CXCursor) -> String {
+    use clang_sys::*;
+    let tu    = clang_Cursor_getTranslationUnit(cursor);
+    let range = clang_getCursorExtent(cursor);
+    let mut toks: *mut CXToken = std::ptr::null_mut();
+    let mut n: u32 = 0;
+    clang_tokenize(tu, range, &mut toks, &mut n);
+    let result = if !toks.is_null() && n > 0 {
+        let tokens = std::slice::from_raw_parts(toks, n as usize);
+        let joined: String = tokens.iter()
+            .map(|&t| cx_string(clang_getTokenSpelling(tu, t)))
+            .collect::<Vec<_>>()
+            .join("");
+        clang_disposeTokens(tu, toks, n);
+        joined
     } else {
         String::new()
     };

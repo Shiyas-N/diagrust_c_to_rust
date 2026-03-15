@@ -949,11 +949,26 @@ impl IrBuilder {
                 match function.as_str() {
                     "sizeof" => {
                         if let Some(CE::Variable(t)) = args.first() {
+                            // `t` may be:
+                            //   (a) a C type name  → sizeof(int), sizeof(MyStruct)
+                            //   (b) a variable name → sizeof(x)     (size of its type)
+                            //   (c) a numeric / char literal text that the token
+                            //       extractor captured as a Variable → sizeof(4), sizeof('a')
+                            //
+                            // For (c) and (b-unknown) we fall back to i32 / the type
+                            // the semantic model knows for that name.
+                            let rust_ty = Self::sizeof_arg_to_rust_type(t, sem);
                             return Ok(IrExpr::Call {
-                                function: format!("std::mem::size_of::<{}>", Self::c_name_to_rust(t)),
+                                function: format!("std::mem::size_of::<{}>", rust_ty),
                                 args: vec![],
                             });
                         }
+                        // sizeof applied to a non-Variable child — just emit size_of::<i32>
+                        // as a safe default.
+                        return Ok(IrExpr::Call {
+                            function: "std::mem::size_of::<i32>".to_string(),
+                            args: vec![],
+                        });
                     }
                     "printf" | "fprintf" | "puts" => {
                         if let Some(IrStatement::Expr(e)) = Self::try_rewrite_io_stmt(expr, sem, struct_fields, fn_param_types) {
@@ -1121,28 +1136,6 @@ impl IrBuilder {
                         }
                     }
 
-                    // ── min/max from algorithm.h ─────────────────────────────
-                    "min" | "MIN" => {
-                        if args.len() >= 2 {
-                            let a = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
-                            let b = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
-                            return Ok(IrExpr::Call {
-                                function: "std::cmp::min".to_string(),
-                                args: vec![a, b],
-                            });
-                        }
-                    }
-                    "max" | "MAX" => {
-                        if args.len() >= 2 {
-                            let a = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
-                            let b = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
-                            return Ok(IrExpr::Call {
-                                function: "std::cmp::max".to_string(),
-                                args: vec![a, b],
-                            });
-                        }
-                    }
-
                     _ => {}
                 }
                 let rust_fn = Self::map_stdlib_fn(function);
@@ -1293,6 +1286,173 @@ impl IrBuilder {
         }
     }
 
+    /// Resolve the argument of a C `sizeof` expression to the appropriate Rust type string.
+    ///
+    /// Handles:
+    ///  1. Known C type keywords  (`int` → `i32`, etc.)
+    ///  2. Variable names in scope → look up the semantic type map
+    ///  3. Array-element expressions → `sizeof(arr[0])` → element type of arr
+    ///  4. Numeric / char literals captured by the token extractor
+    ///     (`sizeof(4)` → `"4"`) → infer from the literal text
+    ///  5. Struct / user type names → pass through as-is
+    fn sizeof_arg_to_rust_type(arg: &str, sem: &semantic::FunctionSemantics) -> String {
+        let trimmed = arg.trim();
+
+        // ── 1. Known C primitive type names ──────────────────────────────────
+        let known = match trimmed {
+            "void"               => Some("()"),
+            "char"               => Some("u8"),
+            "unsigned char"      => Some("u8"),
+            "short"              => Some("i16"),
+            "unsigned short"     => Some("u16"),
+            "int"                => Some("i32"),
+            "unsigned" | "unsigned int" => Some("u32"),
+            "long"               => Some("i64"),
+            "unsigned long"      => Some("u64"),
+            "long long"          => Some("i64"),
+            "unsigned long long" => Some("u64"),
+            "float"              => Some("f32"),
+            "double"             => Some("f64"),
+            "long double"        => Some("f64"),
+            "bool" | "_Bool"     => Some("bool"),
+            "size_t"             => Some("usize"),
+            "ptrdiff_t"          => Some("isize"),
+            _ => None,
+        };
+        if let Some(t) = known { return t.to_string(); }
+
+        // ── 2a. Clang array TYPE spelling: "int [7]", "double [4]", etc. ──
+        // clang_getTypeSpelling emits array types as "<elem_type> [<N>]"
+        // (note the SPACE before '[').  Must be handled before the variable-
+        // subscript check.
+        if let Some(bracket) = trimmed.find('[') {
+            let before = &trimmed[..bracket];
+            let inside = trimmed[bracket + 1..].trim_end_matches(']').trim();
+            if before.ends_with(' ') {
+                // This is a C type spelling, e.g. "int [7]" or "double []"
+                let elem_rust = Self::c_type_name_to_rust(before.trim());
+                if inside.is_empty() {
+                    return elem_rust; // incomplete array → just element type
+                }
+                if let Ok(n) = inside.parse::<u64>() {
+                    return format!("[{}; {}]", elem_rust, n);
+                }
+                return elem_rust; // VLA or unknown size
+            }
+        }
+
+        // ── 2b. Array-element subscript: sizeof(arr[i]) / sizeof(arr[0]) ──────
+        // Strip the subscript and resolve the element type of the array variable.
+        if let Some(bracket) = trimmed.find('[') {
+            let base = trimmed[..bracket].trim();
+            // Look up the array's full Rust type, then extract its element type.
+            let elem = if let Some(rt) = sem.rust_type_map.get(base) {
+                Self::extract_array_elem_type_str(&rt.rust_repr)
+            } else {
+                // Unknown array — default to i32 (most common C array element type)
+                "i32".to_string()
+            };
+            return elem;
+        }
+
+        // ── 3. Variable name in scope ─────────────────────────────────────────
+        if let Some(rt) = sem.rust_type_map.get(trimmed) {
+            return rt.rust_repr.clone();
+        }
+
+        // ── 4. Literal value used as sizeof argument ──────────────────────────
+        //    sizeof(4)   → integer literal → i32
+        //    sizeof(4L)  → long literal   → i64
+        //    sizeof(4U)  → unsigned lit   → u32
+        //    sizeof(4.0) / sizeof(4.0f)   → float literal → f32/f64
+        //    sizeof('a') → char literal   → u8
+
+        // char literal
+        if trimmed.starts_with('\'') { return "u8".to_string(); }
+
+        let lower = trimmed.to_ascii_lowercase();
+        let digits = lower.trim_end_matches(|c: char| "ulfd".contains(c));
+
+        // float literal: contains '.' or 'e'/'E'
+        if digits.contains('.') || digits.contains('e') {
+            if lower.ends_with('f') { return "f32".to_string(); }
+            return "f64".to_string();
+        }
+
+        // integer literal suffixes
+        if lower.ends_with("ull") || lower.ends_with("llu") { return "u64".to_string(); }
+        if lower.ends_with("ll")                             { return "i64".to_string(); }
+        if lower.ends_with("ul") || lower.ends_with("lu")   { return "u64".to_string(); }
+        if lower.ends_with('u')                              { return "u32".to_string(); }
+        if lower.ends_with('l')                              { return "i64".to_string(); }
+
+        // bare decimal / hex / octal integer
+        if trimmed.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            return "i32".to_string();
+        }
+
+        // ── 5. Struct / user type — pass through as-is ───────────────────────
+        trimmed.to_string()
+    }
+
+    /// Extract the element type from a Rust array or Vec type string.
+    ///
+    /// `[i32; 7]`  → `"i32"`
+    /// Convert a C primitive type name string to its Rust equivalent.
+    /// Used by sizeof_arg_to_rust_type for Clang array type spellings.
+    fn c_type_name_to_rust(c: &str) -> String {
+        match c.trim() {
+            "void"                       => "()",
+            "char" | "unsigned char"     => "u8",
+            "signed char"                => "i8",
+            "short" | "short int"
+            | "signed short"
+            | "signed short int"         => "i16",
+            "unsigned short"
+            | "unsigned short int"       => "u16",
+            "int" | "signed" | "signed int" => "i32",
+            "unsigned" | "unsigned int"  => "u32",
+            "long" | "long int"
+            | "signed long"
+            | "signed long int"          => "i64",
+            "unsigned long"
+            | "unsigned long int"        => "u64",
+            "long long" | "long long int"
+            | "signed long long"
+            | "signed long long int"     => "i64",
+            "unsigned long long"
+            | "unsigned long long int"   => "u64",
+            "float"                      => "f32",
+            "double"                     => "f64",
+            "long double"                => "f64",
+            "bool" | "_Bool"             => "bool",
+            "size_t"                     => "usize",
+            "ptrdiff_t"                  => "isize",
+            other                        => other,
+        }.to_string()
+    }
+
+        /// `[f64; 3]`  → `"f64"`
+    /// `Vec<i32>`  → `"i32"`
+    /// `i32`       → `"i32"`   (already a scalar — use it directly)
+    fn extract_array_elem_type_str(rust_type: &str) -> String {
+        let t = rust_type.trim();
+        // [T; N]
+        if t.starts_with('[') {
+            if let (Some(start), Some(semi)) = (t.find('['), t.find(';')) {
+                return t[start + 1..semi].trim().to_string();
+            }
+        }
+        // Vec<T>
+        if let Some(inner) = t.strip_prefix("Vec<") {
+            if let Some(inner) = inner.strip_suffix('>') {
+                return inner.trim().to_string();
+            }
+        }
+        // Scalar type (e.g. sizeof applied to a non-array variable)
+        t.to_string()
+    }
+
     pub fn fallback_type(ctype: &CType) -> String {
         match ctype {
             CType::Void   => "()" .to_string(),
@@ -1318,8 +1478,32 @@ impl IrBuilder {
         match (&expr, rust_type) {
             (IrExpr::IntLit(n), "f32") => IrExpr::FloatLit(*n as f64),
             (IrExpr::IntLit(n), "f64") => IrExpr::FloatLit(*n as f64),
+            // std::mem::size_of returns usize; insert cast when assigned to
+            // any signed/unsigned integer type other than usize.
+            _ if Self::expr_yields_usize(&expr) && Self::is_target_integer(rust_type) => {
+                IrExpr::Cast { to_type: rust_type.to_string(), expr: Box::new(expr) }
+            }
             _ => expr,
         }
+    }
+
+    /// True when `expr` is — or is a binary operation entirely composed of —
+    /// `std::mem::size_of` calls, meaning its Rust type is `usize`.
+    fn expr_yields_usize(expr: &IrExpr) -> bool {
+        match expr {
+            IrExpr::Call { function, .. } => function.starts_with("std::mem::size_of"),
+            IrExpr::BinOp { left, right, .. } => {
+                Self::expr_yields_usize(left) || Self::expr_yields_usize(right)
+            }
+            IrExpr::Cast { to_type, .. } => to_type == "usize",
+            _ => false,
+        }
+    }
+
+    /// Integer types that are NOT usize — i.e. need an explicit cast from usize.
+    fn is_target_integer(t: &str) -> bool {
+        matches!(t, "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+                  | "u8" | "u16" | "u32" | "u64" | "u128")
     }
 
     fn infer_expr_type(expr: &IrExpr, sem: &semantic::FunctionSemantics) -> Option<String> {

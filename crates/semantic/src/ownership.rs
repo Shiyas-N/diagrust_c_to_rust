@@ -126,14 +126,23 @@ impl OwnershipInferrer {
 
                 CStatement::Assignment { target, value } => {
                     if target == name { return true; }
-                    // Deref-assign: `*name = v` shows up as an Expression in the
-                    // raw parse but also as an assign-through in some paths.
+                    // Deref-assign: `*name = v`
                     if Self::expr_writes_through(name, value) { return true; }
+                    // If the value expression passes `name` to a function call,
+                    // the callee may mutate through it.
+                    if Self::expr_passes_ptr_to_call(name, value) { return true; }
                 }
 
-                // A bare expression statement may contain `*name = v`
+                CStatement::VarDecl { init: Some(e), .. } => {
+                    if Self::expr_passes_ptr_to_call(name, e) { return true; }
+                }
+
+                // A bare expression statement may contain `*name = v` or a call
                 CStatement::Expression(e) => {
                     if Self::expr_writes_through(name, e) { return true; }
+                    // Key fix: `withdraw(from, amount)` — `from` is passed directly
+                    // to a function; that callee takes `&mut T` → we must be `&mut T`
+                    if Self::expr_passes_ptr_to_call(name, e) { return true; }
                 }
 
                 // Recurse into compound statements
@@ -196,6 +205,28 @@ impl OwnershipInferrer {
             CExpression::BinaryOp { left, right, .. } => {
                 Self::expr_writes_through(name, left) || Self::expr_writes_through(name, right)
             }
+            _ => false,
+        }
+    }
+
+    /// Returns true when expression `e` contains a direct Call where `name`
+    /// appears as a positional argument (i.e., the pointer is handed to a callee
+    /// who may mutate through it).  This makes the conservative choice to treat
+    /// pointer params passed to *any* call as potentially mutable.
+    fn expr_passes_ptr_to_call(name: &str, e: &CExpression) -> bool {
+        match e {
+            CExpression::Call { args, .. } => {
+                args.iter().any(|a| matches!(a, CExpression::Variable(n) if n == name))
+            }
+            // Recurse into sub-expressions that may contain nested calls
+            CExpression::BinaryOp { left, right, .. } => {
+                Self::expr_passes_ptr_to_call(name, left)
+                    || Self::expr_passes_ptr_to_call(name, right)
+            }
+            CExpression::UnaryOp { operand, .. } => {
+                Self::expr_passes_ptr_to_call(name, operand)
+            }
+            CExpression::Cast { expr, .. } => Self::expr_passes_ptr_to_call(name, expr),
             _ => false,
         }
     }

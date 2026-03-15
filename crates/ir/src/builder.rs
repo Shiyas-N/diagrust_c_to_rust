@@ -2179,13 +2179,19 @@ impl IrBuilder {
             match &arg {
                 IrExpr::Var(name) => {
                     // If this var is already a &mut [T] in the current function
-                    // (it IS the mutable slice param), do NOT wrap in another &mut —
-                    // that causes E0596. Rust handles implicit reborrow automatically.
-                    let already_mut_slice = sem.rust_type_map
+                    // (it is itself a pointer/array PARAMETER), do NOT wrap in &mut —
+                    // that causes E0596 ("cannot borrow as mutable, already a mutable borrow").
+                    // Check 1: semantic rust_type_map already says &mut [...]
+                    let already_by_type = sem.rust_type_map
                         .get(name)
                         .map(|rt| rt.rust_repr.starts_with("&mut ["))
                         .unwrap_or(false);
-                    if already_mut_slice { return arg; }
+                    // Check 2: it is a *parameter* with a pointer/array C type
+                    // (the IR builder turns these into &mut [T] params).
+                    let already_as_param = sem.symbol_table.get(name)
+                        .map(|s| s.is_parameter && (s.is_pointer || s.is_array))
+                        .unwrap_or(false);
+                    if already_by_type || already_as_param { return arg; }
                     return IrExpr::RefMut(Box::new(arg));
                 }
                 IrExpr::ArrayAccess { .. } => return arg,

@@ -510,9 +510,15 @@ unsafe fn extract_var_decl(cursor: clang_sys::CXCursor) -> Option<CStatement> {
     let init = unsafe {
         let children = collect_children(cursor);
         match &var_type {
-            CType::Array(_, _) => {
+            CType::Array(inner, _) => {
                 children.iter().find_map(|&c| {
-                    if clang_sys::clang_getCursorKind(c) == clang_sys::CXCursor_InitListExpr {
+                    let ck = clang_sys::clang_getCursorKind(c);
+                    if ck == clang_sys::CXCursor_InitListExpr {
+                        extract_expr(c)
+                    } else if ck == clang_sys::CXCursor_StringLiteral
+                        && matches!(inner.as_ref(), CType::Char | CType::UChar)
+                    {
+                        // char str[N] = "Hello"  →  StringLit initializer
                         extract_expr(c)
                     } else {
                         None

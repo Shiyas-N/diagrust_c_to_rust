@@ -362,7 +362,8 @@ impl FunctionTranslator {
                     IrExpr::ReadLine { var }        => emit_read_line(&ind, var),
                     IrExpr::Exit(code)              =>
                         format!("{}std::process::exit({});\n", ind, ExprEmitter::emit(code)?),
-                    other => format!("{}{};", ind, ExprEmitter::emit(other)?),
+                    other => format!("{}{};
+", ind, ExprEmitter::emit(other)?),
                 }
             }
 

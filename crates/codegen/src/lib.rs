@@ -14,9 +14,8 @@ impl CodeAssembler {
         out.push_str("// Compiler-in-the-Loop C to Rust Transpiler\n\n");
 
         let mut uses = program.required_uses.clone();
-        if program.is_executable {
-            uses.push("std::io::{self, Write}".to_string());
-        }
+        // std::io::{self, Write} is added by the IR builder only when print! (with flush)
+        // is actually used. We do NOT add it unconditionally here anymore.
         uses.sort();
         uses.dedup();
         for u in &uses {
@@ -263,12 +262,36 @@ impl FunctionTranslator {
         Ok(match stmt {
             IrStatement::LetBinding { name, rust_type, init, is_mutable } => {
                 let mut_kw = if *is_mutable { "mut " } else { "" };
+                // For heap-allocated inits, derive the correct Rust type from the expression
+                // rather than trusting the declared (possibly stale *mut T) type.
+                let effective_type: std::borrow::Cow<str> = match init {
+                    Some(IrExpr::BoxNew(inner)) => {
+                        // Box<T> — infer T from inner expression or use declared inner
+                        let inner_ty = if rust_type.starts_with("Box<") {
+                            rust_type.as_str().to_owned()
+                        } else if rust_type.starts_with("*mut ") {
+                            format!("Box<{}>", &rust_type["*mut ".len()..])
+                        } else {
+                            rust_type.clone()
+                        };
+                        std::borrow::Cow::Owned(inner_ty)
+                    }
+                    Some(IrExpr::VecNew { elem_type, .. }) => {
+                        if elem_type == "u8" || elem_type == "char" {
+                            std::borrow::Cow::Borrowed("String")
+                        } else {
+                            std::borrow::Cow::Owned(format!("Vec<{}>", elem_type))
+                        }
+                    }
+                    _ => std::borrow::Cow::Borrowed(rust_type.as_str()),
+                };
+                let rust_type = effective_type.as_ref();
                 let rhs = if let Some(expr) = init {
                     let emitted = ExprEmitter::emit(expr)?;
                     // If the init expression is a comparison but the target type is
                     // an integer (C's `int result = a > b;`), wrap with
                     // `if expr { 1 } else { 0 }`.
-                    let is_int_type = matches!(rust_type.as_str(),
+                    let is_int_type = matches!(rust_type,
                         "i8"|"i16"|"i32"|"i64"|"u8"|"u16"|"u32"|"u64"|"isize"|"usize");
                     let is_comparison = matches!(expr,
                         IrExpr::BinOp { op: BinOp::Greater | BinOp::Less |
@@ -276,6 +299,11 @@ impl FunctionTranslator {
                             BinOp::Equal | BinOp::NotEqual, .. });
                     if is_int_type && is_comparison {
                         format!(" = if {} {{ 1 }} else {{ 0 }}", emitted)
+                    } else if rust_type == "String" && matches!(expr, IrExpr::StringLit(_)) {
+                        // `"Hello"` is &str; coerce to String for String-typed variables
+                        format!(" = {}.to_string()", emitted)
+                    } else if rust_type == "String" && emitted == "String::new()" {
+                        " = String::new()".to_string()
                     } else {
                         format!(" = {}", emitted)
                     }
@@ -287,6 +315,11 @@ impl FunctionTranslator {
                     } else { " = Vec::new()".to_string() }
                 } else if rust_type.starts_with("Vec<") {
                     " = Vec::new()".to_string()
+                } else if rust_type == "String" {
+                    " = String::new()".to_string()
+                } else if rust_type.starts_with("Box<") {
+                    // Box vars always need init from patch_malloc_vars; bare decl is unusual
+                    String::new()
                 } else { String::new() };
                 if rhs.is_empty() {
                     format!("{}let {}{}: {};\n", ind, mut_kw, name, rust_type)
@@ -295,8 +328,12 @@ impl FunctionTranslator {
                 }
             }
 
-            IrStatement::Assign { target, value } =>
-                format!("{}{} = {};\n", ind, target, ExprEmitter::emit(value)?),
+            IrStatement::Assign { target, value } => {
+                let rhs = ExprEmitter::emit(value)?;
+                // Strip any `as *mut T` or `as String` cast wrapping Vec/Box allocations
+                // that may remain if type upgrade didn't fully propagate.
+                format!("{}{} = {};\n", ind, target, rhs)
+            }
 
             IrStatement::IndexAssign { array, index, value } =>
                 format!("{}{}[{}] = {};\n", ind, array, ExprEmitter::emit(index)?, ExprEmitter::emit(value)?),
@@ -331,18 +368,28 @@ impl FunctionTranslator {
 
             IrStatement::Drop(var) => format!("{}drop({});\n", ind, var),
 
-            IrStatement::Scanf { vars } => {
-                // Emit one typed stdin-read block per variable.
-                // Each variable must already be declared (let mut var: T) in scope.
+            IrStatement::Scanf { vars: _, targets } => {
                 let mut s = String::new();
-                for var in vars {
+                for target in targets {
+                    let lhs = ExprEmitter::emit(target)?;
                     s.push_str(&format!(
-                        "{ind}{{\n\
-                         {ind}    let mut _buf = String::new();\n\
-                         {ind}    io::stdin().read_line(&mut _buf).expect(\"Failed to read input\");\n\
-                         {ind}    {var} = _buf.trim().parse().unwrap_or_default();\n\
-                         {ind}}}\n",
-                        ind = ind, var = var
+                        "{ind}{{
+\
+                         {ind}    let mut _buf = String::new();
+\
+                         {ind}    io::stdin().read_line(&mut _buf)
+\
+                         {ind}        .expect(\"Failed to read input\");
+\
+                         {ind}    let _tok = _buf.split_whitespace()
+\
+                         {ind}        .next().unwrap_or(\"\");
+\
+                         {ind}    {lhs} = _tok.parse().unwrap_or_default();
+\
+                         {ind}}}
+",
+                        ind = ind, lhs = lhs
                     ));
                 }
                 s
@@ -527,6 +574,19 @@ impl ExprEmitter {
                 if function == "__strcat__" && args.len() == 2 {
                     return Ok(format!("{{ {}.push_str(&{}); }}", Self::emit(&args[0])?, Self::emit(&args[1])?));
                 }
+                // strcat as statement: dst.push_str(src)
+                if function == "__strcat_stmt__" && args.len() == 2 {
+                    let src = Self::emit(&args[1])?;
+                    let src_ref = if src.starts_with('"') { src } else { format!("&{}", src) };
+                    return Ok(format!("{}.push_str({})", Self::emit(&args[0])?, src_ref));
+                }
+                // format!(fmt, args...) — from sprintf-style assignment
+                if function.starts_with("__format__:") {
+                    let fmt_str = &function["__format__:".len()..];
+                    let rest = args.iter().map(Self::emit)
+                        .collect::<anyhow::Result<Vec<_>>>()?  .join(", ");
+                    return Ok(format!("format!(\"{fmt}\", {rest})", fmt = fmt_str, rest = rest));
+                }
                 // memset(arr, val) → arr.fill(val)
                 if function == "__memset__" && args.len() == 2 {
                     return Ok(format!("{}.fill({})", Self::emit(&args[0])?, Self::emit(&args[1])?));
@@ -534,6 +594,87 @@ impl ExprEmitter {
                 // memcpy(dst, src) → dst.copy_from_slice(&src)
                 if function == "__memcpy__" && args.len() == 2 {
                     return Ok(format!("{}.copy_from_slice(&{})", Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+
+                // ── New string function sentinels ────────────────────────────
+
+                // sprintf(buf, fmt, ...) → buf = format!(fmt, ...)
+                // Encoded as __sprintf__:fmt_string with buf as args[0]
+                if function.starts_with("__sprintf__:") {
+                    let fmt_str = &function["__sprintf__:".len()..];
+                    if !args.is_empty() {
+                        let buf = Self::emit(&args[0])?;
+                        if args.len() == 1 {
+                            return Ok(
+                                [buf.as_str(), " = \"", fmt_str, "\"", ".to_string()"].concat()
+                            );
+                        } else {
+                            let rest = args[1..].iter()
+                                .map(Self::emit)
+                                .collect::<anyhow::Result<Vec<_>>>()?
+                                .join(", ");
+                            return Ok(
+                                [buf.as_str(), " = format!(\"", fmt_str, "\", ", rest.as_str(), ")"].concat()
+                            );
+                        }
+                    }
+                }
+
+                // strstr(haystack, needle) → haystack.find(needle) (returns Option<usize>)
+                // We keep it simple: map to a bool-like check common in C usage
+                if function == "__strstr__" && args.len() == 2 {
+                    return Ok(format!("{}.find({})", Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+
+                // strchr(s, c) → s.find(c as char) → None/Some
+                if function == "__strchr__" && args.len() == 2 {
+                    return Ok(format!("{}.find({} as char)", Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+                if function == "__strrchr__" && args.len() == 2 {
+                    return Ok(format!("{}.rfind({} as char)", Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+
+                // strtol(s, base) → i64::from_str_radix(s.trim(), base).unwrap_or(0)
+                if function == "__strtol__" && args.len() == 2 {
+                    return Ok(format!("i64::from_str_radix({}.trim(), {} as u32).unwrap_or(0)",
+                        Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+
+                // strtof(s) → s.trim().parse::<f32>().unwrap_or(0.0)
+                if function == "__strtof__" && args.len() == 1 {
+                    return Ok(format!("{}.trim().parse::<f32>().unwrap_or(0.0)", Self::emit(&args[0])?));
+                }
+
+                // strtod(s) → s.trim().parse::<f64>().unwrap_or(0.0)
+                if function == "__strtod__" && args.len() == 1 {
+                    return Ok(format!("{}.trim().parse::<f64>().unwrap_or(0.0)", Self::emit(&args[0])?));
+                }
+
+                // strncmp(a, b, n) → a.get(..n as usize).unwrap_or("").cmp(b.get(..n as usize).unwrap_or("")) as i32
+                if function == "__strncmp__" && args.len() == 3 {
+                    let a = Self::emit(&args[0])?;
+                    let b = Self::emit(&args[1])?;
+                    let n = Self::emit(&args[2])?;
+                    return Ok(format!(
+                        "{}.get(..({}) as usize).unwrap_or(\"\").cmp({}.get(..({}) as usize).unwrap_or(\"\")) as i32",
+                        a, n, b, n
+                    ));
+                }
+
+                // strnlen(s, max) → s.len().min(max as usize)
+                if function == "__strnlen__" && args.len() == 2 {
+                    return Ok(format!("{}.len().min(({}) as usize)", Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+
+                // strtok(s, delim) — emit a note; strtok is stateful and hard to translate directly
+                if function == "__strtok__" && args.len() == 2 {
+                    return Ok(format!("/* strtok: use split() */ {}.split({}).next().unwrap_or(\"\")",
+                        Self::emit(&args[0])?, Self::emit(&args[1])?));
+                }
+
+                // getchar() → { let mut b = [0u8;1]; std::io::stdin().read(&mut b).ok(); b[0] as i32 }
+                if function == "__getchar__" {
+                    return Ok("{{ let mut __b = [0u8; 1]; use std::io::Read; std::io::stdin().read_exact(&mut __b).ok(); __b[0] as i32 }}".to_string());
                 }
                 let args_str = args.iter()
                     .map(Self::emit)
@@ -561,8 +702,13 @@ impl ExprEmitter {
             IrExpr::RefCellNew(inner) => format!("RefCell::new({})", Self::emit(inner)?),
 
             IrExpr::VecNew { elem_type, len } => {
+                // char/u8 arrays from C → String::with_capacity (used for char* str)
+                if elem_type == "u8" || elem_type == "char" {
+                    // If length is a constant, use with_capacity; otherwise new()
+                    return Ok(format!("String::with_capacity({} as usize)", Self::emit(len)?));
+                }
                 let zero = primitive_default(elem_type);
-                format!("vec![{}; {}]", zero, Self::emit(len)?)
+                format!("vec![{}; {} as usize]", zero, Self::emit(len)?)
             }
 
             IrExpr::StructDefault(name) => format!("{}::default()", name),

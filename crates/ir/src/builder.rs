@@ -164,6 +164,250 @@ impl IrBuilder {
 
     /// Walk all expressions in `stmts` and collect variable names that appear
     /// directly as `IrExpr::RefMut(Var(name))` — i.e., passed as `&mut name`.
+
+    // ── Malloc / Box patching pass ────────────────────────────────────────────
+    //
+    // C pattern:
+    //   struct Foo *p;
+    //   p = (struct Foo*) malloc(sizeof(struct Foo));
+    //   if (p == NULL) { ... }
+    //   p->field = value;
+    //   free(p);
+    //
+    // Generated IR before this pass:
+    //   LetBinding { name:"p", rust_type:"*mut Foo", init:None }
+    //   Assign     { target:"p", value:BoxNew(StructDefault("Foo")) }
+    //   If { condition: BinOp(Var("p"), Equal, NullMut), ... }
+    //   FieldAssign { object:"p", field:"field", value:... }
+    //   Drop("p")
+    //
+    // After this pass:
+    //   LetBinding { name:"p", rust_type:"Box<Foo>", init:Some(BoxNew(...)), is_mutable:true }
+    //   [Assign removed — merged into LetBinding]
+    //   If { condition: BoolLit(false), ... }       ← Box::new never fails
+    //   FieldAssign { object:"p", field:"field", ... }  ← Box auto-derefs
+    //   Drop("p")
+    //
+    fn patch_malloc_vars(stmts: Vec<IrStatement>) -> Vec<IrStatement> {
+        // Pass 1: collect ALL heap-allocated vars (BoxNew or VecNew assignments).
+        let mut box_vars: std::collections::HashSet<String> = Default::default();
+        for stmt in &stmts {
+            match stmt {
+                IrStatement::Assign { target, value } if Self::expr_is_heap_alloc(value) => {
+                    box_vars.insert(target.clone());
+                }
+                // Also catch inline let: `let arr: *mut T = VecNew { .. }`
+                IrStatement::LetBinding { name, init: Some(value), .. }
+                    if Self::expr_is_heap_alloc(value) => {
+                    box_vars.insert(name.clone());
+                }
+                _ => {}
+            }
+        }
+        if box_vars.is_empty() { return stmts; }
+
+        // Pass 2: rewrite.
+        let mut out: Vec<IrStatement> = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
+            match stmt {
+                // LetBinding { *mut T, None }  →  upgrade type, init filled later
+                // LetBinding { *mut T, VecNew/BoxNew }  →  upgrade type inline
+                IrStatement::LetBinding { ref name, ref rust_type, ref init, ref is_mutable }
+                    if box_vars.contains(name) && rust_type.starts_with("*mut ") =>
+                {
+                    let inner = rust_type["*mut ".len()..].to_string();
+                    let new_type = Self::heap_alloc_type(&inner, init.as_ref());
+                    let cloned_init = init.clone();
+                    let cloned_mut = *is_mutable;
+                    let cloned_name = name.clone();
+                    out.push(IrStatement::LetBinding {
+                        name: cloned_name,
+                        rust_type: new_type,
+                        init: cloned_init,
+                        is_mutable: cloned_mut || true,
+                    });
+                }
+
+                // Assign { target, BoxNew/VecNew }  →  inject init into the LetBinding
+                IrStatement::Assign { ref target, ref value }
+                    if box_vars.contains(target) && Self::expr_is_heap_alloc(value) =>
+                {
+                    let mut found = false;
+                    for existing in out.iter_mut().rev() {
+                        if let IrStatement::LetBinding { name, rust_type, init, .. } = existing {
+                            if name == target && init.is_none() {
+                                // Only upgrade the type if it is still a raw pointer.
+                                // If it was already upgraded to Box<T>/Vec<T>/String by
+                                // the LetBinding arm, do NOT run heap_alloc_type again —
+                                // that would produce Box<Box<T>>.
+                                if rust_type.starts_with("*mut ") {
+                                    let inner = rust_type["*mut ".len()..].to_string();
+                                    *rust_type = Self::heap_alloc_type(&inner, Some(value));
+                                }
+                                // else: type already correct, just inject the init
+                                *init = Some(value.clone());
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found { out.push(stmt); }
+                }
+
+                // If { BinOp(Var(box_var), Equal/NotEqual, Null/NullMut) }
+                // → replace condition with BoolLit(false) / BoolLit(true)
+                IrStatement::If { condition, then_block, else_block } => {
+                    let new_cond = Self::rewrite_null_check_condition(condition, &box_vars);
+                    // Recurse into branches
+                    let new_then = Self::patch_malloc_vars(then_block);
+                    let new_else = else_block.map(Self::patch_malloc_vars);
+                    out.push(IrStatement::If { condition: new_cond, then_block: new_then, else_block: new_else });
+                }
+
+                // Recurse into loops / nested blocks
+                IrStatement::While { condition, body } => {
+                    let new_body = Self::patch_malloc_vars(body);
+                    out.push(IrStatement::While { condition, body: new_body });
+                }
+                IrStatement::While2 { init, condition, increment, body } => {
+                    let new_body = Self::patch_malloc_vars(body);
+                    out.push(IrStatement::While2 { init, condition, increment, body: new_body });
+                }
+                IrStatement::Loop { body, condition } => {
+                    let new_body = Self::patch_malloc_vars(body);
+                    out.push(IrStatement::Loop { body: new_body, condition });
+                }
+
+                other => {
+                    // Rewrite IrExpr::FieldAccess { Deref(Var(box_var)), field }
+                    // → IrExpr::FieldAccess { Var(box_var), field }
+                    // Box/Vec auto-deref in Rust; (*s).id → s.id
+                    let rewritten = Self::simplify_deref_field_accesses(other, &box_vars);
+                    out.push(rewritten);
+                }
+            }
+        }
+        out
+    }
+
+    /// Walk an IrStatement and simplify `(*box_var).field` → `box_var.field`.
+    fn simplify_deref_field_accesses(stmt: IrStatement, box_vars: &std::collections::HashSet<String>) -> IrStatement {
+        match stmt {
+            IrStatement::Expr(e) =>
+                IrStatement::Expr(Self::simplify_expr_derefs(e, box_vars)),
+            IrStatement::Return(Some(e)) =>
+                IrStatement::Return(Some(Self::simplify_expr_derefs(e, box_vars))),
+            IrStatement::LetBinding { name, rust_type, init, is_mutable } =>
+                IrStatement::LetBinding { name, rust_type, init: init.map(|e| Self::simplify_expr_derefs(e, box_vars)), is_mutable },
+            IrStatement::Assign { target, value } =>
+                IrStatement::Assign { target, value: Self::simplify_expr_derefs(value, box_vars) },
+            IrStatement::FieldAssign { object, field, value } =>
+                IrStatement::FieldAssign { object, field, value: Self::simplify_expr_derefs(value, box_vars) },
+            other => other,
+        }
+    }
+
+    fn simplify_expr_derefs(expr: IrExpr, box_vars: &std::collections::HashSet<String>) -> IrExpr {
+        match expr {
+            // (*box_var).field  →  box_var.field
+            IrExpr::FieldAccess { object, field } => {
+                let simplified_obj = match *object {
+                    IrExpr::Deref(inner) => {
+                        if matches!(*inner, IrExpr::Var(ref n) if box_vars.contains(n)) {
+                            *inner  // drop the Deref
+                        } else {
+                            IrExpr::Deref(inner)
+                        }
+                    }
+                    other => Self::simplify_expr_derefs(other, box_vars),
+                };
+                IrExpr::FieldAccess { object: Box::new(simplified_obj), field }
+            }
+            // Recurse into other expression containers
+            IrExpr::BinOp { left, op, right } => IrExpr::BinOp {
+                left:  Box::new(Self::simplify_expr_derefs(*left,  box_vars)),
+                op,
+                right: Box::new(Self::simplify_expr_derefs(*right, box_vars)),
+            },
+            IrExpr::UnaryOp { op, operand } => IrExpr::UnaryOp {
+                op, operand: Box::new(Self::simplify_expr_derefs(*operand, box_vars)),
+            },
+            IrExpr::Call { function, args } => IrExpr::Call {
+                function,
+                args: args.into_iter().map(|a| Self::simplify_expr_derefs(a, box_vars)).collect(),
+            },
+            other => other,
+        }
+    }
+
+    fn expr_is_heap_alloc(expr: &IrExpr) -> bool {
+        matches!(expr, IrExpr::BoxNew(_) | IrExpr::VecNew { .. })
+    }
+
+    /// Given the inner type (stripped of `*mut`) and an optional init expression,
+    /// decide the idiomatic Rust type for a heap-allocated variable.
+    fn heap_alloc_type(inner: &str, init: Option<&IrExpr>) -> String {
+        match init {
+            Some(IrExpr::BoxNew(_)) => format!("Box<{}>", inner),
+            Some(IrExpr::VecNew { elem_type, .. }) => {
+                if elem_type == "u8" || elem_type == "char" || inner == "u8" || inner == "String" {
+                    "String".to_string()
+                } else {
+                    format!("Vec<{}>", elem_type)
+                }
+            }
+            // No init yet — decide by inner type: if struct → Box, else Vec
+            None => {
+                if inner.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    format!("Box<{}>", inner)
+                } else if inner == "u8" || inner == "String" {
+                    "String".to_string()
+                } else {
+                    format!("Vec<{}>", inner)
+                }
+            }
+            _ => format!("*mut {}", inner),
+        }
+    }
+    // keep the old name as an alias for clarity
+    fn expr_is_box_alloc(expr: &IrExpr) -> bool {
+        matches!(expr, IrExpr::BoxNew(_))
+    }
+
+    /// Replace `box_var == NULL` with `false` and `box_var != NULL` with `true`.
+    fn is_null_expr(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Null | IrExpr::NullMut => true,
+            IrExpr::IntLit(0) => true,
+            // (void*)0, (int*)0, (T*)0 — any pointer cast of zero
+            IrExpr::Cast { to_type, expr } if to_type.starts_with('*') =>
+                matches!(expr.as_ref(), IrExpr::IntLit(0)),
+            _ => false,
+        }
+    }
+
+    fn rewrite_null_check_condition(cond: IrExpr, box_vars: &std::collections::HashSet<String>) -> IrExpr {
+        // Extract the operator and operand names before any moves.
+        let rewrite = if let IrExpr::BinOp { ref left, ref op, ref right } = cond {
+            let left_is_heap  = matches!(left.as_ref(),  IrExpr::Var(n) if box_vars.contains(n));
+            let right_is_heap = matches!(right.as_ref(), IrExpr::Var(n) if box_vars.contains(n));
+            let left_is_null  = Self::is_null_expr(left.as_ref());
+            let right_is_null = Self::is_null_expr(right.as_ref());
+            if (left_is_heap && right_is_null) || (right_is_heap && left_is_null) {
+                match op {
+                    ast_input::BinOp::Equal    => Some(IrExpr::BoolLit(false)),
+                    ast_input::BinOp::NotEqual => Some(IrExpr::BoolLit(true)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        rewrite.unwrap_or(cond)
+    }
+
     fn collect_mut_ref_vars(stmts: &[IrStatement], out: &mut HashSet<String>) {
         for stmt in stmts {
             match stmt {
@@ -382,6 +626,9 @@ impl IrBuilder {
         // Post-process: upgrade `let m: *mut T = fn_call()` to `let mut m: &mut T`
         // when fn_call's return type has been upgraded from *mut T to &mut T.
         let raw_body = Self::upgrade_ptr_return_bindings(raw_body, fn_return_types);
+        // Post-process: merge `let s: *mut T;` + `s = Box::new(T::default())` into
+        // `let mut s: Box<T> = Box::new(T::default())`, and rewrite NULL checks.
+        let raw_body = Self::patch_malloc_vars(raw_body);
         let raw_body = if is_main { Self::strip_main_return(raw_body) } else { raw_body };
 
         let raw_body = Self::rewrite_swap_patterns(raw_body);
@@ -553,9 +800,32 @@ impl IrBuilder {
     }
 
     fn strip_main_return(stmts: Vec<IrStatement>) -> Vec<IrStatement> {
-        stmts.into_iter().filter(|s| {
-            !matches!(s, IrStatement::Return(Some(IrExpr::IntLit(0)))
-                       | IrStatement::Return(None))
+        stmts.into_iter().flat_map(|s| {
+            match s {
+                // return 0 / bare return → drop entirely (main returns ())
+                IrStatement::Return(None)
+                | IrStatement::Return(Some(IrExpr::IntLit(0))) => vec![],
+                // return N (N != 0) → std::process::exit(N)
+                IrStatement::Return(Some(IrExpr::IntLit(n))) =>
+                    vec![IrStatement::Expr(IrExpr::Exit(Box::new(IrExpr::IntLit(n))))],
+                // return expr → std::process::exit(expr as i32)
+                IrStatement::Return(Some(e)) =>
+                    vec![IrStatement::Expr(IrExpr::Exit(Box::new(e)))],
+                // Recurse into If/loop bodies
+                IrStatement::If { condition, then_block, else_block } =>
+                    vec![IrStatement::If {
+                        condition,
+                        then_block: Self::strip_main_return(then_block),
+                        else_block: else_block.map(Self::strip_main_return),
+                    }],
+                IrStatement::While { condition, body } =>
+                    vec![IrStatement::While { condition, body: Self::strip_main_return(body) }],
+                IrStatement::While2 { init, condition, increment, body } =>
+                    vec![IrStatement::While2 { init, condition, increment, body: Self::strip_main_return(body) }],
+                IrStatement::Loop { body, condition } =>
+                    vec![IrStatement::Loop { body: Self::strip_main_return(body), condition }],
+                other => vec![other],
+            }
         }).collect()
     }
 
@@ -733,17 +1003,100 @@ impl IrBuilder {
                     let s_ir = Self::build_expr(args.first()?, sem, struct_fields, fn_param_types).ok()?;
                     return Some(IrStatement::Expr(IrExpr::PrintLn { fmt: "{}".to_string(), args: vec![s_ir] }));
                 }
-                "scanf" | "fscanf" => {
-                    let vars: Vec<String> = args.iter().skip(1).filter_map(|a| {
-                        if let CE::UnaryOp { op: ast_input::UnaryOp::AddrOf, operand } = a {
-                            if let CE::Variable(v) = operand.as_ref() {
-                                return Some(v.clone());
-                            }
+                // ── strcpy(dst, src) → dst = src.clone() ─────────────
+                "strcpy" | "strncpy" => {
+                    if args.len() >= 2 {
+                        if let CE::Variable(dst) = &args[0] {
+                            let src = Self::build_expr(&args[1], sem, struct_fields, fn_param_types).ok()?;
+                            return Some(IrStatement::Assign {
+                                target: dst.clone(),
+                                value:  IrExpr::Clone(Box::new(src)),
+                            });
                         }
-                        None
-                    }).collect();
-                    if !vars.is_empty() {
-                        return Some(IrStatement::Scanf { vars });
+                    }
+                }
+                // ── strcat(dst, src) → dst.push_str(src) ─────────────
+                "strcat" | "strncat" => {
+                    if args.len() >= 2 {
+                        if let CE::Variable(dst) = &args[0] {
+                            let src = Self::build_expr(&args[1], sem, struct_fields, fn_param_types).ok()?;
+                            return Some(IrStatement::Expr(IrExpr::Call {
+                                function: "__strcat_stmt__".to_string(),
+                                args: vec![IrExpr::Var(dst.clone()), src],
+                            }));
+                        }
+                    }
+                }
+                // ── sprintf(buf, fmt, ...) as statement ──────────────
+                "sprintf" | "snprintf" => {
+                    let fmt_idx = if function == "snprintf" { 2 } else { 1 };
+                    if args.len() > fmt_idx {
+                        if let CE::Variable(dst) = &args[0] {
+                            let fmt_arg = &args[fmt_idx];
+                            let rest = &args[fmt_idx + 1..];
+                            let (rust_fmt, rest_args) = Self::translate_printf_fmt(fmt_arg, rest);
+                            let ir_args: Vec<IrExpr> = rest_args.iter()
+                                .filter_map(|a| Self::build_expr(a, sem, struct_fields, fn_param_types).ok())
+                                .collect();
+                            let rhs = if ir_args.is_empty() {
+                                IrExpr::StringLit(rust_fmt)
+                            } else {
+                                IrExpr::Call {
+                                    function: format!("__format__:{}", rust_fmt),
+                                    args: ir_args,
+                                }
+                            };
+                            return Some(IrStatement::Assign {
+                                target: dst.clone(),
+                                value: rhs,
+                            });
+                        }
+                    }
+                }
+                "scanf" | "fscanf" => {
+                    let skip = if function == "fscanf" { 2 } else { 1 };
+                    let mut vars: Vec<String>  = Vec::new();
+                    let mut targets: Vec<IrExpr> = Vec::new();
+                    for a in args.iter().skip(skip) {
+                        match a {
+                            // &var  →  simple variable target
+                            CE::UnaryOp { op: ast_input::UnaryOp::AddrOf, operand } => {
+                                match operand.as_ref() {
+                                    CE::Variable(v) => {
+                                        vars.push(v.clone());
+                                        targets.push(IrExpr::Var(v.clone()));
+                                    }
+                                    // &arr[i]  →  index target
+                                    CE::ArrayAccess { array, index } => {
+                                        if let CE::Variable(arr_name) = array.as_ref() {
+                                            vars.push(format!("{}[i]", arr_name));
+                                            let idx_ir = Self::build_expr(index, sem, struct_fields, fn_param_types)
+                                                .unwrap_or(IrExpr::IntLit(0));
+                                            targets.push(IrExpr::ArrayAccess {
+                                                array: Box::new(IrExpr::Var(arr_name.clone())),
+                                                index: Box::new(IrExpr::AsUsize(Box::new(idx_ir))),
+                                            });
+                                        }
+                                    }
+                                    // &(*ptr).field  or other complex
+                                    other => {
+                                        if let Ok(expr) = Self::build_expr(other, sem, struct_fields, fn_param_types) {
+                                            vars.push(format!("{:?}", other).chars().take(16).collect());
+                                            targets.push(expr);
+                                        }
+                                    }
+                                }
+                            }
+                            // bare var (some C code passes without &)
+                            CE::Variable(v) => {
+                                vars.push(v.clone());
+                                targets.push(IrExpr::Var(v.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !targets.is_empty() {
+                        return Some(IrStatement::Scanf { vars, targets });
                     }
                 }
                 "exit" => {
@@ -873,14 +1226,26 @@ impl IrBuilder {
         use ast_input::CExpression as CE;
         if let CE::Call { function, args } = size_expr {
             if function == "sizeof" {
+                // Clang emits type spellings like "struct Student" or just "Student".
+                // Strip the "struct "/"union " prefix before looking up in struct_fields.
                 let is_struct = args.first()
                     .and_then(|a| if let CE::Variable(v) = a { Some(v.as_str()) } else { None })
-                    .map(|t| struct_fields.contains_key(t))
+                    .map(|t| {
+                        let bare = t.trim_start_matches("struct ")
+                                    .trim_start_matches("union ")
+                                    .trim();
+                        struct_fields.contains_key(bare) || struct_fields.contains_key(t)
+                    })
                     .unwrap_or(false);
+                // Also use the bare elem_type (may already have "struct " stripped by
+                // pointer_element_type, but double-check).
+                let bare_elem = elem_type.trim_start_matches("struct ")
+                                          .trim_start_matches("union ")
+                                          .trim();
                 return if is_struct {
-                    IrExpr::BoxNew(Box::new(IrExpr::StructDefault(elem_type.to_string())))
+                    IrExpr::BoxNew(Box::new(IrExpr::StructDefault(bare_elem.to_string())))
                 } else {
-                    IrExpr::BoxNew(Box::new(IrExpr::IntLit(0)))
+                    IrExpr::BoxNew(Box::new(IrExpr::StructDefault(bare_elem.to_string())))
                 };
             }
         }
@@ -899,10 +1264,16 @@ impl IrBuilder {
     }
 
     fn pointer_element_type(ctype: &CType) -> String {
-        match ctype {
+        let raw = match ctype {
             CType::Pointer(inner) => Self::fallback_type(inner),
             other => Self::fallback_type(other),
-        }
+        };
+        // Clang sometimes includes "struct "/"union " in type spellings; strip it
+        // so struct names are bare identifiers that match struct_fields keys.
+        raw.trim_start_matches("struct ")
+           .trim_start_matches("union ")
+           .trim()
+           .to_string()
     }
 
     // ── Expression builder ───────────────────────────────────────────────────
@@ -1132,6 +1503,184 @@ impl IrBuilder {
                                 left: Box::new(a),
                                 op: ast_input::BinOp::Equal,
                                 right: Box::new(b),
+                            });
+                        }
+                    }
+
+                    // ── sprintf / snprintf: format to string ─────────────
+                    "sprintf" | "snprintf" => {
+                        // sprintf(buf, fmt, args...) → buf = format!(fmt, args...)
+                        // We emit this as a special __sprintf__ sentinel handled in codegen
+                        let fmt_idx = if function == "snprintf" { 2 } else { 1 };
+                        if args.len() > fmt_idx {
+                            let buf = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let fmt_arg = &args[fmt_idx];
+                            let rest = &args[fmt_idx + 1..];
+                            let (rust_fmt, rest_args) = Self::translate_printf_fmt(fmt_arg, rest);
+                            let mut all_args = vec![buf];
+                            all_args.extend(rest_args.iter()
+                                .map(|a| Self::build_expr(a, sem, struct_fields, fn_param_types))
+                                .collect::<anyhow::Result<Vec<_>>>()?);
+                            return Ok(IrExpr::Call {
+                                function: format!("__sprintf__:{}", rust_fmt),
+                                args: all_args,
+                            });
+                        }
+                    }
+
+                    // ── strstr(haystack, needle) → haystack.find(needle) ────
+                    "strstr" => {
+                        if args.len() >= 2 {
+                            let haystack = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let needle   = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strstr__".to_string(),
+                                args: vec![haystack, needle],
+                            });
+                        }
+                    }
+
+                    // ── strchr(s, c) / strrchr(s, c) ────────────────────────
+                    "strchr" => {
+                        if args.len() >= 2 {
+                            let s = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let c = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strchr__".to_string(),
+                                args: vec![s, c],
+                            });
+                        }
+                    }
+                    "strrchr" => {
+                        if args.len() >= 2 {
+                            let s = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let c = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strrchr__".to_string(),
+                                args: vec![s, c],
+                            });
+                        }
+                    }
+
+                    // ── strtol(s, endptr, base) → i64::from_str_radix ───────
+                    "strtol" | "strtoul" | "strtoll" | "strtoull" => {
+                        if args.len() >= 1 {
+                            let s    = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let base = if args.len() >= 3 {
+                                Self::build_expr(&args[2], sem, struct_fields, fn_param_types)?
+                            } else { IrExpr::IntLit(10) };
+                            return Ok(IrExpr::Call {
+                                function: "__strtol__".to_string(),
+                                args: vec![s, base],
+                            });
+                        }
+                    }
+
+                    // ── strtof / strtod ──────────────────────────────────────
+                    "strtof" => {
+                        if let Some(s) = args.first() {
+                            let obj = Self::build_expr(s, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strtof__".to_string(),
+                                args: vec![obj],
+                            });
+                        }
+                    }
+                    "strtod" => {
+                        if let Some(s) = args.first() {
+                            let obj = Self::build_expr(s, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strtod__".to_string(),
+                                args: vec![obj],
+                            });
+                        }
+                    }
+
+                    // ── strdup(s) → s.clone() ────────────────────────────────
+                    "strdup" | "_strdup" => {
+                        if let Some(s) = args.first() {
+                            let obj = Self::build_expr(s, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Clone(Box::new(obj)));
+                        }
+                    }
+
+                    // ── strncmp(a, b, n) → a[..n].cmp(&b[..n]) as i32 ───────
+                    "strncmp" => {
+                        if args.len() >= 3 {
+                            let a = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let b = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            let n = Self::build_expr(&args[2], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strncmp__".to_string(),
+                                args: vec![a, b, n],
+                            });
+                        }
+                    }
+
+                    // ── strnlen(s, max) → s.len().min(max) ──────────────────
+                    "strnlen" => {
+                        if args.len() >= 2 {
+                            let s   = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let max = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strnlen__".to_string(),
+                                args: vec![s, max],
+                            });
+                        }
+                    }
+
+                    // ── strtok(s, delim) → split-based iterator ──────────────
+                    "strtok" => {
+                        if args.len() >= 2 {
+                            let s     = Self::build_expr(&args[0], sem, struct_fields, fn_param_types)?;
+                            let delim = Self::build_expr(&args[1], sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "__strtok__".to_string(),
+                                args: vec![s, delim],
+                            });
+                        }
+                    }
+
+                    // ── String-level toupper/tolower ─────────────────────────
+                    // (character-level versions are handled above as FieldAccess)
+                    // These handle the case where a whole String is passed.
+
+                    // ── fgets(buf, n, stdin) → read_line ─────────────────────
+                    "fgets" => {
+                        if let Some(buf) = args.first() {
+                            if let CE::Variable(name) = buf {
+                                return Ok(IrExpr::ReadLine { var: name.clone() });
+                            }
+                        }
+                    }
+
+                    // ── getchar() → read single byte from stdin ───────────────
+                    "getchar" => {
+                        return Ok(IrExpr::Call {
+                            function: "__getchar__".to_string(),
+                            args: vec![],
+                        });
+                    }
+
+                    // ── putchar(c) ────────────────────────────────────────────
+                    "putchar" => {
+                        if let Some(c) = args.first() {
+                            let obj = Self::build_expr(c, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Print {
+                                fmt: "{}
+".to_string(),
+                                args: vec![IrExpr::Cast { to_type: "char".to_string(), expr: Box::new(obj) }],
+                            });
+                        }
+                    }
+
+                    // ── NULL-check helpers for string args ────────────────────
+                    "assert" => {
+                        if let Some(cond) = args.first() {
+                            let c = Self::build_expr(cond, sem, struct_fields, fn_param_types)?;
+                            return Ok(IrExpr::Call {
+                                function: "assert".to_string(),
+                                args: vec![c],
                             });
                         }
                     }
@@ -1466,7 +2015,17 @@ impl IrBuilder {
             CType::Bool   => "bool".to_string(),
             CType::Float  => "f32".to_string(),
             CType::Double => "f64".to_string(),
+            // char* / unsigned char* → String (C-style string)
+            CType::Pointer(inner) if matches!(inner.as_ref(), CType::Char | CType::UChar) =>
+                "String".to_string(),
+            // void* → *mut u8 (raw byte pointer)
+            CType::Pointer(inner) if matches!(inner.as_ref(), CType::Void) =>
+                "*mut u8".to_string(),
+            // Other pointers → Box<T> when it's a struct, *mut T for primitives
             CType::Pointer(inner) => format!("*mut {}", Self::fallback_type(inner)),
+            // char[] → String; other arrays stay as [T; N]
+            CType::Array(inner, _) if matches!(inner.as_ref(), CType::Char | CType::UChar) =>
+                "String".to_string(),
             CType::Array(inner, Some(n)) => format!("[{}; {}]", Self::fallback_type(inner), n),
             CType::Array(inner, None)    => format!("Vec<{}>",  Self::fallback_type(inner)),
             CType::Struct(name)          => name.clone(),
@@ -1558,30 +2117,60 @@ impl IrBuilder {
 
     // ── IO usage detection ───────────────────────────────────────────────────
     /// Returns true if any function uses `Print` (i.e. needs io::stdout().flush())
+    /// Returns true if `use std::io::{self, Write}` is needed.
+    /// This covers: print! (needs flush), scanf (needs stdin().read_line), ReadLine.
     fn ir_uses_print_flush(functions: &[IrFunction]) -> bool {
-        functions.iter().any(|f| Self::stmts_use_print(&f.body))
+        functions.iter().any(|f| Self::stmts_use_io(&f.body))
     }
 
-    fn stmts_use_print(stmts: &[IrStatement]) -> bool {
+    fn stmts_use_io(stmts: &[IrStatement]) -> bool {
         stmts.iter().any(|s| match s {
+            // print! with flush
             IrStatement::Expr(IrExpr::Print { .. })
             | IrStatement::Expr(IrExpr::EPrintLn { .. }) => true,
+            // scanf / read_line all use io::stdin()
+            IrStatement::Scanf { .. } => true,
+            IrStatement::Expr(IrExpr::ReadLine { .. }) => true,
             IrStatement::If { then_block, else_block, .. } =>
-                Self::stmts_use_print(then_block)
-                || else_block.as_ref().map(|e| Self::stmts_use_print(e)).unwrap_or(false),
+                Self::stmts_use_io(then_block)
+                || else_block.as_ref().map(|e| Self::stmts_use_io(e)).unwrap_or(false),
             IrStatement::While { body, .. }
-            | IrStatement::Loop { body, .. } => Self::stmts_use_print(body),
-            IrStatement::While2 { body, .. } => Self::stmts_use_print(body),
+            | IrStatement::Loop { body, .. } => Self::stmts_use_io(body),
+            IrStatement::While2 { body, .. } => Self::stmts_use_io(body),
             _ => false,
         })
+    }
+
+    // Keep old name for callers that check only print
+    fn stmts_use_print(stmts: &[IrStatement]) -> bool {
+        Self::stmts_use_io(stmts)
     }
 
     /// Returns true if any function uses raw pointer types (needs `use std::ptr`)
     fn ir_uses_raw_ptr(functions: &[IrFunction]) -> bool {
         functions.iter().any(|f| {
-            f.parameters.iter().any(|p| p.rust_type.contains("*mut") || p.rust_type.contains("*const"))
-            || f.rust_return_type.contains("*mut")
-            || f.rust_return_type.contains("*const")
+            // Check function signature
+            let sig_has_ptr = f.parameters.iter().any(|p|
+                p.rust_type.contains("*mut") || p.rust_type.contains("*const"))
+                || f.rust_return_type.contains("*mut")
+                || f.rust_return_type.contains("*const");
+            // Also check local variable bindings in the body
+            let body_has_ptr = Self::stmts_use_raw_ptr(&f.body);
+            sig_has_ptr || body_has_ptr
+        })
+    }
+
+    fn stmts_use_raw_ptr(stmts: &[IrStatement]) -> bool {
+        stmts.iter().any(|s| match s {
+            IrStatement::LetBinding { rust_type, .. } =>
+                rust_type.contains("*mut") || rust_type.contains("*const"),
+            IrStatement::If { then_block, else_block, .. } =>
+                Self::stmts_use_raw_ptr(then_block)
+                || else_block.as_ref().map(|e| Self::stmts_use_raw_ptr(e)).unwrap_or(false),
+            IrStatement::While { body, .. }
+            | IrStatement::Loop { body, .. } => Self::stmts_use_raw_ptr(body),
+            IrStatement::While2 { body, .. } => Self::stmts_use_raw_ptr(body),
+            _ => false,
         })
     }
 

@@ -100,6 +100,14 @@ impl TypeMapper {
                 is_idiomatic: true,
             },
             CType::Pointer(inner) => Self::map_pointer(inner, ownership),
+            // char[N] and unsigned char[N] → String (C-style string buffer)
+            CType::Array(inner, _) if matches!(inner.as_ref(), CType::Char | CType::UChar) => {
+                RustType {
+                    rust_repr: "String".to_string(),
+                    requires_unsafe: false,
+                    is_idiomatic: true,
+                }
+            }
             CType::Array(inner, Some(size)) => {
                 let inner_rt = Self::map_type(inner, &OwnershipKind::Value, false);
                 RustType {
@@ -136,6 +144,22 @@ impl TypeMapper {
     }
 
     fn map_pointer(inner: &CType, ownership: &OwnershipKind) -> RustType {
+        // char* and unsigned char* are always C-style strings → String
+        if matches!(inner, CType::Char | CType::UChar) {
+            return RustType {
+                rust_repr: "String".to_string(),
+                requires_unsafe: false,
+                is_idiomatic: true,
+            };
+        }
+        // void* → raw byte pointer
+        if matches!(inner, CType::Void) {
+            return RustType {
+                rust_repr: "*mut u8".to_string(),
+                requires_unsafe: true,
+                is_idiomatic: false,
+            };
+        }
         let inner_base = Self::c_primitive_str(inner).unwrap_or_else(|| "u8".to_string());
         match ownership {
             OwnershipKind::UniqueOwned => RustType {

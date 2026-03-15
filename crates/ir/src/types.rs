@@ -71,7 +71,7 @@ pub enum IrStatement {
     /// Swap two array elements in-place: arr.swap(i, j)
     SwapElements { array: String, i: IrExpr, j: IrExpr },
     /// Read one or more values from stdin (from C scanf)
-    Scanf { vars: Vec<String> },
+    Scanf { vars: Vec<String>, targets: Vec<IrExpr> },
 }
 
 #[derive(Debug, Clone)]

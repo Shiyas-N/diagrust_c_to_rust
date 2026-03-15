@@ -494,9 +494,9 @@ impl eframe::App for DiagRustApp {
                     }
                     validate_c_in_thread(self.c_source.clone(), self.strict_validate, Arc::clone(&self.result));
                     self.active_tab = Tab::Validation;
-                }
-                ui.checkbox(&mut self.strict_validate, "Strict")
-                    .on_hover_text("Enable strict C validation (type mismatches, dangerous patterns)");
+                };
+                // ui.checkbox(&mut self.strict_validate, "Strict")
+                //     .on_hover_text("Enable strict C validation (type mismatches, dangerous patterns)");
 
                 ui.separator();
 

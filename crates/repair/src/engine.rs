@@ -88,6 +88,12 @@ impl RepairEngine {
             }
 
             if matches!(err_code, Some("E0308")) {
+                // Bool condition coercion: `expected bool, found i32` on if/while lines
+                if diag.message.contains("expected `bool`") && diag.message.contains("found `i32`") {
+                    let (r, c) = Self::repair_bool_condition(&current, diag);
+                    if c { current = r; actions.push(action("BoolCondition", "Wrapped i32 expression with != 0 for bool context")); }
+                }
+
                 if diag.message.contains("expected `f32`") || diag.message.contains("expected `f64`") {
                     let (r, c) = Self::repair_int_to_float_literal(&current, diag);
                     if c { current = r; actions.push(action("IntToFloat", "Changed integer literal to float literal")); }
@@ -437,29 +443,48 @@ impl RepairEngine {
     }
 
     fn repair_slice_coercion(code: &str, diag: &RustcDiagnostic) -> (String, bool) {
+        // Pattern 1: "expected `&mut [T]`, found `&mut [T; N]`"
+        // → Replace `&mut varname` with `&mut varname[..]` on the error line.
         if diag.message.contains("expected `&mut [") {
             if let Some(line_no) = diag.primary_line() {
                 let mut lines: Vec<String> = code.lines().map(String::from).collect();
                 if line_no > 0 && line_no <= lines.len() {
                     let line = lines[line_no - 1].clone();
+
+                    // Case A: already has `&mut varname` but is a fixed array → add [..]
+                    // Replace `&mut word` where word is NOT followed by `[` or `.`
+                    let re_already_mut = Regex::new(r"&mut (\w+)(?!\[|\.)").unwrap();
+                    let new_line = re_already_mut.replace_all(&line, "&mut $1[..]").to_string();
+                    if new_line != line {
+                        lines[line_no - 1] = new_line;
+                        return (lines.join("\n"), true);
+                    }
+
+                    // Case B: bare `varname` as argument (no &mut yet) → add &mut varname[..]
                     let re = Regex::new(r"(\w+)\(([^)]+)\)").unwrap();
-                    let word_re_inner = Regex::new(r"[a-z_]\w*").unwrap();
+                    let word_re = Regex::new(r"\b([a-z_]\w*)\b").unwrap();
                     let new_line = re.replace_all(&line, |caps: &regex::Captures| {
+                        let fn_name = &caps[1];
                         let args = &caps[2];
                         let mut fixed = String::new();
                         let mut last = 0usize;
-                        for m in word_re_inner.find_iter(args) {
+                        for m in word_re.find_iter(args) {
                             let before = &args[..m.start()];
                             let after  = &args[m.end()..];
                             let preceded = before.ends_with('&') || before.ends_with('*');
                             let followed = after.starts_with('[') || after.starts_with('.') || after.starts_with('(');
                             fixed.push_str(&args[last..m.start()]);
-                            if !preceded && !followed { fixed.push_str("&mut "); }
-                            fixed.push_str(m.as_str());
+                            if !preceded && !followed {
+                                fixed.push_str("&mut ");
+                                fixed.push_str(m.as_str());
+                                fixed.push_str("[..]");
+                            } else {
+                                fixed.push_str(m.as_str());
+                            }
                             last = m.end();
                         }
                         fixed.push_str(&args[last..]);
-                        if fixed != args { format!("{}({})", &caps[1], fixed) }
+                        if fixed != args { format!("{}({})", fn_name, fixed) }
                         else { caps[0].to_string() }
                     }).to_string();
                     if new_line != line {
@@ -686,6 +711,55 @@ impl RepairEngine {
         if cleaned != result { result = cleaned; changed = true; }
 
         (result, changed)
+    }
+
+    /// Wrap an i32-valued expression used as a bool condition with `!= 0`.
+    ///
+    /// Handles:
+    ///   `if is_empty() {`       → `if is_empty() != 0 {`
+    ///   `while !is_empty() {`   → `while is_empty() == 0 {`
+    ///   `} else if foo() {`     → `} else if foo() != 0 {`
+    fn repair_bool_condition(code: &str, diag: &RustcDiagnostic) -> (String, bool) {
+        let line_no = match diag.primary_line() { Some(n) => n, None => return (code.to_string(), false) };
+        let mut lines: Vec<String> = code.lines().map(String::from).collect();
+        if line_no == 0 || line_no > lines.len() { return (code.to_string(), false); }
+        let line = lines[line_no - 1].clone();
+
+        // Match if/while/else-if condition lines
+        // Pattern: `INDENT (if|while|} else if) CONDITION {`
+        let cond_re = Regex::new(r"^(\s*(?:(?:}\s*)?else\s+)?(?:if|while))\s+(.+?)\s*(\{.*)$").unwrap();
+        if let Some(caps) = cond_re.captures(&line) {
+            let keyword = caps[1].to_string();
+            let cond    = caps[2].trim().to_string();
+            let tail    = caps[3].to_string();
+
+            // Skip if already has a comparison operator or is a bool literal
+            if cond.contains("==") || cond.contains("!=") || cond.contains("<=")
+                || cond.contains(">=") || cond.contains('<') || cond.contains('>')
+                || cond == "true" || cond == "false" {
+                return (code.to_string(), false);
+            }
+
+            // `!expr` → `expr == 0`; `expr` → `expr != 0`
+            let new_cond = if let Some(inner) = cond.strip_prefix('!') {
+                let inner = inner.trim();
+                // Only transform if inner looks like a call or simple var
+                if inner.ends_with(')') || inner.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    format!("{} == 0", inner)
+                } else {
+                    return (code.to_string(), false);
+                }
+            } else if cond.ends_with(')') || cond.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                format!("{} != 0", cond)
+            } else {
+                return (code.to_string(), false);
+            };
+
+            lines[line_no - 1] = format!("{} {} {}", keyword, new_cond, tail);
+            return (lines.join("
+"), true);
+        }
+        (code.to_string(), false)
     }
 
     fn repair_lifetime_annotation(code: &str, _diag: &RustcDiagnostic) -> (String, bool) {

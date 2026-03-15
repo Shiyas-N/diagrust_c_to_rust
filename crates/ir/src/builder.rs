@@ -2178,20 +2178,33 @@ impl IrBuilder {
         if param_type.starts_with("&mut [") {
             match &arg {
                 IrExpr::Var(name) => {
-                    // If this var is already a &mut [T] in the current function
-                    // (it is itself a pointer/array PARAMETER), do NOT wrap in &mut —
-                    // that causes E0596 ("cannot borrow as mutable, already a mutable borrow").
-                    // Check 1: semantic rust_type_map already says &mut [...]
+                    // Check 1: already a &mut [T] in the semantic type map
                     let already_by_type = sem.rust_type_map
                         .get(name)
                         .map(|rt| rt.rust_repr.starts_with("&mut ["))
                         .unwrap_or(false);
                     // Check 2: it is a *parameter* with a pointer/array C type
-                    // (the IR builder turns these into &mut [T] params).
                     let already_as_param = sem.symbol_table.get(name)
                         .map(|s| s.is_parameter && (s.is_pointer || s.is_array))
                         .unwrap_or(false);
                     if already_by_type || already_as_param { return arg; }
+
+                    // Check 3: it is a local fixed-size array [T; N]
+                    // Passing &mut arr where arr: [T; N] to &mut [T] needs &mut arr[..]
+                    let is_fixed_array = sem.rust_type_map
+                        .get(name)
+                        .map(|rt| rt.rust_repr.starts_with('['))
+                        .unwrap_or(false)
+                        || sem.symbol_table.get(name)
+                            .map(|s| s.is_array && !s.is_parameter)
+                            .unwrap_or(false);
+                    if is_fixed_array {
+                        // Emit &mut arr[..] so Rust coerces [T;N] → [T]
+                        return IrExpr::RefMut(Box::new(IrExpr::ArrayAccess {
+                            array: Box::new(arg),
+                            index: Box::new(IrExpr::Var("..".to_string())),
+                        }));
+                    }
                     return IrExpr::RefMut(Box::new(arg));
                 }
                 IrExpr::ArrayAccess { .. } => return arg,

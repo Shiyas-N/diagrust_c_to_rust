@@ -684,8 +684,14 @@ impl ExprEmitter {
                 format!("{}({})", function, args_str)
             }
 
-            IrExpr::ArrayAccess { array, index } =>
-                format!("{}[{}]", Self::emit(array)?, Self::emit(index)?),
+            IrExpr::ArrayAccess { array, index } => {
+                // Special sentinel: index = Var("..") means a full slice [..]
+                if matches!(index.as_ref(), IrExpr::Var(s) if s == "..") {
+                    format!("{}[..]", Self::emit(array)?)
+                } else {
+                    format!("{}[{}]", Self::emit(array)?, Self::emit(index)?)
+                }
+            }
 
             IrExpr::ArrayLiteral(elems) => {
                 let s = elems.iter().map(Self::emit).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
